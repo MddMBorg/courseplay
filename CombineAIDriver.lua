@@ -19,13 +19,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ---@class CombineAIDriver : UnloadableFieldworkAIDriver
 CombineAIDriver = CpObject(UnloadableFieldworkAIDriver)
 
--- chopper: 0= pipe folded (really? isn't this 1?), 2,= autoaiming;  combine: 1 = closed  2= open
-CombineAIDriver.PIPE_STATE_MOVING = 0
-CombineAIDriver.PIPE_STATE_CLOSED = 1
-CombineAIDriver.PIPE_STATE_OPEN = 2
 
 -- fill level when we start making a pocket to unload if we are on the outermost headland
 CombineAIDriver.pocketFillLevelFullPercentage = 95
+CombineAIDriver.safeUnloadDistanceBeforeEndOfRow = 40
 
 CombineAIDriver.myStates = {
 	PULLING_BACK_FOR_UNLOAD = {},
@@ -34,6 +31,8 @@ CombineAIDriver.myStates = {
 	REVERSING_TO_MAKE_A_POCKET = {},
 	MAKING_POCKET = {},
 	WAITING_FOR_UNLOAD_IN_POCKET = {},
+	WAITING_FOR_UNLOAD_BEFORE_STARTING_NEXT_ROW = {},
+	UNLOADING_BEFORE_STARTING_NEXT_ROW = {},
 	WAITING_FOR_UNLOAD_AFTER_FIELDWORK_ENDED = {},
 	WAITING_FOR_UNLOADER_TO_LEAVE = {},
 	RETURNING_FROM_POCKET = {},
@@ -50,6 +49,12 @@ CombineAIDriver.turnTypes = {
 	HEADLAND_POCKET = {},
 	UP_DOWN_NORMAL = {}
 }
+
+-- Developer hack: to check the class of an object one should use the is_a() defined in CpObject.lua.
+-- However, when we reload classes on the fly during the development, the is_a() calls in other modules still
+-- have the old class definition (for example CombineUnloadManager.lua) of this class and thus, is_a() fails.
+-- Therefore, use this instead, this is safe after a reload.
+CombineAIDriver.isACombineAIDriver = true
 
 function CombineAIDriver:init(vehicle)
 	courseplay.debugVehicle(11, vehicle, 'CombineAIDriver:init()')
@@ -68,9 +73,17 @@ function CombineAIDriver:init(vehicle)
 	if self.vehicle.spec_combine then
 		self.combine = self.vehicle.spec_combine
 	else
-		local combineImplement = FieldworkAIDriver.getImplementWithSpecialization(self.vehicle, Combine)
+		local combineImplement = AIDriverUtil.getAIImplementWithSpecialization(self.vehicle, Combine)
+        local peletizerImplement = FS19_addon_strawHarvest and
+				AIDriverUtil.getAIImplementWithSpecialization(self.vehicle, FS19_addon_strawHarvest.StrawHarvestPelletizer) or nil
 		if combineImplement then
 			self.combine = combineImplement.spec_combine
+        elseif peletizerImplement then
+            self.combine = peletizerImplement
+            self.combine.fillUnitIndex = 1
+            self.combine.spec_aiImplement.rightMarker = self.combine.rootNode
+            self.combine.spec_aiImplement.leftMarker  = self.combine.rootNode
+            self.combine.spec_aiImplement.backMarker  = self.combine.rootNode
 		else
 			self:error('Vehicle is not a combine and could not find implement with spec_combine')
 		end
@@ -80,7 +93,7 @@ function CombineAIDriver:init(vehicle)
 		self.pipe = self.vehicle.spec_pipe
 		self.objectWithPipe = self.vehicle
 	else
-		local implementWithPipe = FieldworkAIDriver.getImplementWithSpecialization(self.vehicle, Pipe)
+		local implementWithPipe = AIDriverUtil.getAIImplementWithSpecialization(self.vehicle, Pipe)
 		if implementWithPipe then
 			self.pipe = implementWithPipe.spec_pipe
 			self.objectWithPipe = implementWithPipe
@@ -99,20 +112,20 @@ function CombineAIDriver:init(vehicle)
 				Foldable.setAnimTime(self.vehicle.spec_foldable, self.vehicle.spec_foldable.startAnimTime == 1 and 0 or 1, true)
 			end
 		end
-		if self.pipe.currentState == CombineAIDriver.PIPE_STATE_CLOSED then
+		if self.pipe.currentState == AIDriverUtil.PIPE_STATE_CLOSED then
 			wasClosed = true
 			if self.pipe.animation.name then
 				self.pipe:setAnimationTime(self.pipe.animation.name, 1, true)
 			else
 				-- as seen in the Giants pipe code
-				self.objectWithPipe:setPipeState(CombineAIDriver.PIPE_STATE_OPEN)
+				self.objectWithPipe:setPipeState(AIDriverUtil.PIPE_STATE_OPEN)
 				self.objectWithPipe:updatePipeNodes(999999, nil)
 			end
 		end
 		local dischargeNode = self.combine:getCurrentDischargeNode()
 		self:fixDischargeDistance(dischargeNode)
 		local dx, _, _ = localToLocal(dischargeNode.node, self.combine.rootNode, 0, 0, 0)
-		self.pipeOnLeftSide = dx > 0
+		self.pipeOnLeftSide = dx >= 0
 		self:debug('Pipe on left side %s', tostring(self.pipeOnLeftSide))
 		-- use self.combine so attached harvesters have the offset relative to the harvester's root node
 		-- (and thus, does not depend on the angle between the tractor and the harvester)
@@ -122,7 +135,7 @@ function CombineAIDriver:init(vehicle)
 			if self.pipe.animation.name then
 				self.pipe:setAnimationTime(self.pipe.animation.name, 0, true)
 			else
-				self.objectWithPipe:setPipeState(CombineAIDriver.PIPE_STATE_CLOSED)
+				self.objectWithPipe:setPipeState(AIDriverUtil.PIPE_STATE_CLOSED)
 				self.objectWithPipe:updatePipeNodes(999999, nil)
 			end
 		end
@@ -150,6 +163,11 @@ function CombineAIDriver:init(vehicle)
 	-- register ourselves at our boss
 	g_combineUnloadManager:addCombineToList(self.vehicle, self)
 	self:measureBackDistance()
+	self.vehicleIgnoredByFrontProximitySensor = CpTemporaryObject()
+	self.waitingForUnloaderAtEndOfRow = CpTemporaryObject()
+	-- if this is not nil, we have a pending rendezvous
+	---@type CpTemporaryObject
+	self.unloadAIDriverToRendezvous = CpTemporaryObject()
 end
 
 --- Get the combine object, this can be different from the vehicle in case of tools towed or mounted on a tractor
@@ -161,9 +179,20 @@ function CombineAIDriver:start(startingPoint)
 	self:clearAllUnloaderInformation()
 	self:addBackwardProximitySensor()
 	UnloadableFieldworkAIDriver.start(self, startingPoint)
+	-- we work with the traffic conflict detector and the proximity sensors instead
+	self:disableCollisionDetection()
+	self:fixMaxRotationLimit()
 	local total, pipeInFruit = self.fieldworkCourse:setPipeInFruitMap(self.pipeOffsetX, self.vehicle.cp.workWidth)
+	local ix = self.fieldworkCourse:getStartingWaypointIx(AIDriverUtil.getDirectionNode(self.vehicle), startingPoint)
+	self:shouldStrawSwathBeOn(ix)
+	self.fillLevelFullPercentage = self.normalFillLevelFullPercentage
 	self:debug('Pipe in fruit map created, there are %d non-headland waypoints, of which at %d the pipe will be in the fruit',
 			total, pipeInFruit)
+end
+
+function CombineAIDriver:stop(msgReference)
+    self:resetFixMaxRotationLimit()
+    UnloadableFieldworkAIDriver.stop(self,msgReference)
 end
 
 function CombineAIDriver:setHudContent()
@@ -174,13 +203,6 @@ end
 function CombineAIDriver:drive(dt)
 	-- handle the pipe in any state
 	self:handlePipe()
-	if self.isChopperWaitingForTrailer then
-		-- Give up all reservations while not moving (and do not reserve anything)
-		self:resetTrafficControl()
-	elseif not self:trafficControlOK() then
-		self:debugSparse('holding due to traffic')
-		self:hold()
-	end
 	-- the rest is the same as the parent class
 	UnloadableFieldworkAIDriver.drive(self, dt)
 end
@@ -245,8 +267,7 @@ function CombineAIDriver:onWaypointPassed(ix)
 		self:debug('Waiting for unload in the pocket')
 		self:setInfoText(self:getFillLevelInfoText())
 		self.fieldworkUnloadOrRefillState = self.states.WAITING_FOR_UNLOAD_IN_POCKET
-		-- reset offset to return to the original up/down row after we unloaded in the pocket
-		self.aiDriverOffsetX = 0
+
 	end
 	if self.returnedFromPocketIx and self.returnedFromPocketIx == ix then
 		-- back to normal look ahead distance for PPC, no tight turns are needed anymore
@@ -257,76 +278,69 @@ function CombineAIDriver:onWaypointPassed(ix)
 end
 
 function CombineAIDriver:isWaitingInPocket()
- return self.fieldworkUnloadOrRefillState == self.states.WAITING_FOR_UNLOAD_IN_POCKET
+ 	return self.fieldworkUnloadOrRefillState == self.states.WAITING_FOR_UNLOAD_IN_POCKET
 end
 
 function CombineAIDriver:changeToFieldworkUnloadOrRefill()
-	if self.vehicle.cp.settings.useRealisticDriving:is(true) then
-		self:checkFruit()
-		-- TODO: check around turn maneuvers we may not want to pull back before a turn
-		if self.vehicle.cp.settings.selfUnload:is(true) and self:startSelfUnload() then
-			self:debug('Start self unload')
-			self:raiseImplements()
+	self:checkFruit()
+	-- TODO: check around turn maneuvers we may not want to pull back before a turn
+	if self.vehicle.cp.settings.selfUnload:is(true) and self:startSelfUnload() then
+		self:debug('Start self unload')
+		self:raiseImplements()
+		self.fieldworkState = self.states.UNLOAD_OR_REFILL_ON_FIELD
+		self.fieldworkUnloadOrRefillState = self.states.DRIVING_TO_SELF_UNLOAD
+		self.ppc:setShortLookaheadDistance()
+		self:disableCollisionDetection()
+	elseif self.vehicle.cp.settings.useRealisticDriving:is(true) and self:shouldMakePocket() then
+		-- I'm on the edge of the field or fruit is on both sides, make a pocket on the right side and wait there for the unload
+		local pocketCourse, nextIx = self:createPocketCourse()
+		if pocketCourse then
+			self:debug('No room to the left, making a pocket for unload')
 			self.fieldworkState = self.states.UNLOAD_OR_REFILL_ON_FIELD
-			self.fieldworkUnloadOrRefillState = self.states.DRIVING_TO_SELF_UNLOAD
+			self.fieldworkUnloadOrRefillState = self.states.REVERSING_TO_MAKE_A_POCKET
+			-- raise header for reversing
+			self:raiseImplements()
+			self:startCourse(pocketCourse, 1, self.course, nextIx)
+			-- tighter turns
 			self.ppc:setShortLookaheadDistance()
-			self:disableCollisionDetection()
-		elseif self:shouldMakePocket() then
-			-- I'm on the edge of the field or fruit is on both sides, make a pocket on the right side and wait there for the unload
-			local pocketCourse, nextIx = self:createPocketCourse()
-			if pocketCourse then
-				self:debug('No room to the left, making a pocket for unload')
-				self.fieldworkState = self.states.UNLOAD_OR_REFILL_ON_FIELD
-				self.fieldworkUnloadOrRefillState = self.states.REVERSING_TO_MAKE_A_POCKET
-				-- raise header for reversing
-				self:raiseImplements()
-				self:startCourse(pocketCourse, 1, self.course, nextIx)
-				-- tighter turns
-				self.ppc:setShortLookaheadDistance()
-			else
-				-- revert to normal behavior
-				UnloadableFieldworkAIDriver.changeToFieldworkUnloadOrRefill(self)
-			end
-		elseif self:shouldPullBack() then
-			-- is our pipe in the fruit? (assuming pipe is on the left side)
-			local pullBackCourse = self:createPullBackCourse()
-			if pullBackCourse then
-				pullBackCourse:print()
-				self:debug('Pipe in fruit, pulling back to make room for unloading')
-				self.fieldworkState = self.states.UNLOAD_OR_REFILL_ON_FIELD
-				self.fieldworkUnloadOrRefillState = self.states.WAITING_FOR_STOP
-				self.courseAfterPullBack = self.course
-				self.ixAfterPullBack = self.ppc:getLastPassedWaypointIx() or self.ppc:getCurrentWaypointIx()
-				-- tighter turns
-				self.ppc:setShortLookaheadDistance()
-				self:startCourse(pullBackCourse, 1)
-			else
-				-- revert to normal behavior
-				UnloadableFieldworkAIDriver.changeToFieldworkUnloadOrRefill(self)
-			end
 		else
-			-- pipe not in fruit, combine not on outermost headland, just do the normal thing
+			-- revert to normal behavior
+			UnloadableFieldworkAIDriver.changeToFieldworkUnloadOrRefill(self)
+		end
+	elseif self.vehicle.cp.settings.useRealisticDriving:is(true) and self:shouldPullBack() then
+		-- is our pipe in the fruit? (assuming pipe is on the left side)
+		local pullBackCourse = self:createPullBackCourse()
+		if pullBackCourse then
+			pullBackCourse:print()
+			self:debug('Pipe in fruit, pulling back to make room for unloading')
+			self.fieldworkState = self.states.UNLOAD_OR_REFILL_ON_FIELD
+			self.fieldworkUnloadOrRefillState = self.states.WAITING_FOR_STOP
+			self.courseAfterPullBack = self.course
+			self.ixAfterPullBack = self.ppc:getLastPassedWaypointIx() or self.ppc:getCurrentWaypointIx()
+			-- tighter turns
+			self.ppc:setShortLookaheadDistance()
+			self:startCourse(pullBackCourse, 1)
+		else
+			-- revert to normal behavior
 			UnloadableFieldworkAIDriver.changeToFieldworkUnloadOrRefill(self)
 		end
 	else
+		-- pipe not in fruit, combine not on outermost headland, just do the normal thing
 		UnloadableFieldworkAIDriver.changeToFieldworkUnloadOrRefill(self)
 	end
 end
 
 function CombineAIDriver:driveFieldwork(dt)
-	if self.fieldworkState == self.states.WORKING then
-		if self.agreedUnloaderRendezvousWaypointIx then
-			local d = self.fieldworkCourse:getDistanceBetweenWaypoints(self.fieldworkCourse:getCurrentWaypointIx(),
-					self.agreedUnloaderRendezvousWaypointIx)
-			if d < 10 then
-				self:debugSparse('Slow down around the unloader rendezvous waypoint %d to let the unloader catch up',
-					self.agreedUnloaderRendezvousWaypointIx)
-				self:setSpeed(self:getWorkSpeed() / 2)
-			end
-		end
-	end
+	self:checkRendezvous()
 	self:checkBlockingUnloader()
 	return UnloadableFieldworkAIDriver.driveFieldwork(self, dt)
+end
+
+function CombineAIDriver:startWaitingForUnloadBeforeNextRow()
+	self:debug('Waiting for unload before starting the next row')
+	self.waitingForUnloaderAtEndOfRow:set(true, 30000)
+	self.fieldworkState = self.states.UNLOAD_OR_REFILL_ON_FIELD
+	self.fieldworkUnloadOrRefillState = self.states.WAITING_FOR_UNLOAD_BEFORE_STARTING_NEXT_ROW
 end
 
 --- Stop for unload/refill while driving the fieldwork course
@@ -348,8 +362,12 @@ function CombineAIDriver:driveFieldworkUnloadOrRefill()
 	elseif self.fieldworkUnloadOrRefillState == self.states.RETURNING_FROM_PULL_BACK then
 		self:setSpeed(self.vehicle.cp.speeds.turn)
 	elseif self.fieldworkUnloadOrRefillState == self.states.WAITING_FOR_UNLOAD_IN_POCKET or
-			self.fieldworkUnloadOrRefillState == self.states.WAITING_FOR_UNLOAD_AFTER_PULLED_BACK then
+			self.fieldworkUnloadOrRefillState == self.states.WAITING_FOR_UNLOAD_AFTER_PULLED_BACK or
+			self.fieldworkUnloadOrRefillState == self.states.UNLOADING_BEFORE_STARTING_NEXT_ROW then
 		if self:unloadFinished() then
+			-- reset offset to return to the original up/down row after we unloaded in the pocket
+			self.aiDriverOffsetX = 0
+
 			self:clearInfoText(self:getFillLevelInfoText())
 			-- wait a bit after the unload finished to give a chance to the unloader to move away
 			self.stateBeforeWaitingForUnloaderToLeave = self.fieldworkUnloadOrRefillState
@@ -358,6 +376,20 @@ function CombineAIDriver:driveFieldworkUnloadOrRefill()
 			self:debug('Unloading finished, wait for the unloader to leave...')
 		else
 			self:setSpeed(0)
+		end
+	elseif self.fieldworkUnloadOrRefillState == self.states.WAITING_FOR_UNLOAD_BEFORE_STARTING_NEXT_ROW then
+		self:setSpeed(0)
+		if self:isDischarging() then
+			self:cancelRendezvous()
+			self.fieldworkUnloadOrRefillState = self.states.UNLOADING_BEFORE_STARTING_NEXT_ROW
+			self:debug('Unloading started at end of row')
+		end
+		if not self.waitingForUnloaderAtEndOfRow:get() then
+			local unloaderWhoDidNotShowUp = self.unloadAIDriverToRendezvous:get()
+			self:cancelRendezvous()
+			if unloaderWhoDidNotShowUp then unloaderWhoDidNotShowUp:onMissedRendezvous(self) end
+			self:debug('Waited for unloader at the end of the row but it did not show up, try to continue')
+			self:changeToFieldwork()
 		end
 	elseif self.fieldworkUnloadOrRefillState == self.states.WAITING_FOR_UNLOAD_AFTER_FIELDWORK_ENDED then
 		local fillLevel = self.vehicle:getFillUnitFillLevel(self.combine.fillUnitIndex)
@@ -387,6 +419,12 @@ function CombineAIDriver:driveFieldworkUnloadOrRefill()
 			elseif self.stateBeforeWaitingForUnloaderToLeave == self.states.WAITING_FOR_UNLOAD_IN_POCKET then
 				self:debug('Unloading in pocket finished, returning to fieldwork')
 				self.fillLevelFullPercentage = self.normalFillLevelFullPercentage
+				self:changeToFieldwork()
+			elseif self.stateBeforeWaitingForUnloaderToLeave == self.states.UNLOADING_BEFORE_STARTING_NEXT_ROW then
+				self:debug('Unloading before next row finished, returning to fieldwork')
+				self:changeToFieldwork()
+			else
+				self:debug('Unloading finished, previous state not known, returning to fieldwork')
 				self:changeToFieldwork()
 			end
 		end
@@ -548,50 +586,103 @@ function CombineAIDriver:checkDistanceUntilFull(ix)
 		self:debug('Fill rate is %.1f l/m, %.1f l/s', self.litersPerMeter, self.litersPerSecond)
 	end
 	local litersUntilFull = self.combine:getFillUnitCapacity(self.combine.fillUnitIndex) - fillLevel
-	local dUntilFull = litersUntilFull / self.litersPerMeter
+	local dUntilFull = litersUntilFull / self.litersPerMeter * 0.9  -- safety margin
 	self.secondsUntilFull = self.litersPerSecond > 0 and (litersUntilFull / self.litersPerSecond) or nil
 	self.waypointIxWhenFull = self.course:getNextWaypointIxWithinDistance(ix, dUntilFull) or self.course:getNumberOfWaypoints()
-	self.waypointIxWhenFull = self:getSafeUnloaderDestinationWaypoint(self.waypointIxWhenFull)
 	self.distanceToWaypointWhenFull =
 		self.course:getDistanceBetweenWaypoints(self.waypointIxWhenFull, self.course:getCurrentWaypointIx())
 	self:debug('Will be full at waypoint %d in %d m',
 			self.waypointIxWhenFull or -1, self.distanceToWaypointWhenFull)
 end
 
+function CombineAIDriver:checkRendezvous()
+	if self.fieldworkState == self.states.WORKING then
+		if self.unloadAIDriverToRendezvous:get() then
+			local d = self.fieldworkCourse:getDistanceBetweenWaypoints(self.fieldworkCourse:getCurrentWaypointIx(),
+					self.agreedUnloaderRendezvousWaypointIx)
+			if d < 10 then
+				self:debugSparse('Slow down around the unloader rendezvous waypoint %d to let the unloader catch up',
+						self.agreedUnloaderRendezvousWaypointIx)
+				self:setSpeed(self:getWorkSpeed() / 2)
+				local dToTurn = self.fieldworkCourse:getDistanceToNextTurn(self.agreedUnloaderRendezvousWaypointIx) or math.huge
+				if dToTurn < 20 then
+					self:debug('Unloader rendezvous waypoint %d is before a turn, waiting for the unloader here',
+							self.agreedUnloaderRendezvousWaypointIx)
+					self:startWaitingForUnloadBeforeNextRow()
+				end
+			elseif self.fieldworkCourse:getCurrentWaypointIx() > self.agreedUnloaderRendezvousWaypointIx then
+				self:debug('Unloader missed the rendezvous at %d', self.agreedUnloaderRendezvousWaypointIx)
+				local unloaderWhoDidNotShowUp = self.unloadAIDriverToRendezvous:get()
+				-- need to call this before onMissedRendezvous as the unloader will call back to set up a new rendezvous
+				-- and we don't want to cancel that right away
+				self:cancelRendezvous()
+				unloaderWhoDidNotShowUp:onMissedRendezvous(self)
+			end
+			if self:isDischarging() then
+				self:debug('Discharging, cancelling unloader rendezvous')
+				self:cancelRendezvous()
+			end
+		end
+	end
+end
+
+function CombineAIDriver:hasRendezvousWith(unloadAIDriver)
+	return self.unloadAIDriverToRendezvous:get() == unloadAIDriver
+end
+
+function CombineAIDriver:cancelRendezvous()
+	local unloader = self.unloadAIDriverToRendezvous:get()
+	self:debug('Rendezvous with %s at waypoint %d cancelled',
+			unloader and nameNum(self.unloadAIDriverToRendezvous:get() or 'N/A'),
+			self.agreedUnloaderRendezvousWaypointIx or -1)
+	self.agreedUnloaderRendezvousWaypointIx = nil
+	self.unloadAIDriverToRendezvous:set(nil, 0)
+end
+
+--- Before the unloader asks for a rendezvous (which may result in a lengthy pathfinding to figure out
+--- the distance), it should check if the combine is willing to rendezvous.
+function CombineAIDriver:isWillingToRendezvous()
+	if self.state ~= self.states.ON_FIELDWORK_COURSE then
+		self:debug('not on fieldwork course, will not rendezvous')
+		return nil
+	elseif self.vehicle.cp.settings.allowUnloadOnFirstHeadland:is(false) and
+			self.fieldworkCourse:isOnHeadland(self.fieldworkCourse:getCurrentWaypointIx(), 1) then
+		self:debug('on first headland and unload not allowed on first headland, will not rendezvous')
+		return nil
+	end
+	return true
+end
+
+--- When the unloader asks us for a rendezvous, provide him with a waypoint index to meet us.
+--- This waypoint should be a good location to unload (pipe not in fruit, not in a turn, etc.)
+--- If no such waypoint found, reject the rendezvous.
 ---@param unloaderEstimatedSecondsEnroute number minimum time the unloader needs to get to the combine
+---@param unloadAIDriver CombineUnloadAIDriver the driver requesting the rendezvous
 ---@return Waypoint, number, number waypoint to meet the unloader, index of waypoint, time we need to reach that waypoint
-function CombineAIDriver:getUnloaderRendezvousWaypoint(unloaderEstimatedSecondsEnroute)
+function CombineAIDriver:getUnloaderRendezvousWaypoint(unloaderEstimatedSecondsEnroute, unloadAIDriver)
 
 	local dToUnloaderRendezvous = unloaderEstimatedSecondsEnroute * self:getWorkSpeed() / 3.6
-	local unloaderRendezvousWaypointIx = self.fieldworkCourse:getNextWaypointIxWithinDistance(self.fieldworkCourse:getCurrentWaypointIx(),
-			dToUnloaderRendezvous) or self.fieldworkCourse:getNumberOfWaypoints()
+	-- this is where we'll be when the unloader gets here
+	local unloaderRendezvousWaypointIx = self.fieldworkCourse:getNextWaypointIxWithinDistance(
+			self.fieldworkCourse:getCurrentWaypointIx(), dToUnloaderRendezvous) or
+			self.fieldworkCourse:getNumberOfWaypoints()
 
-	self:debug('Seconds until full: %d, unloader ETE: %d', self.secondsUntilFull or -1, unloaderEstimatedSecondsEnroute)
+	self:debug('Rendezvous request: seconds until full: %d, unloader ETE: %d (around my wp %d, in %d meters), full at waypoint %d, ',
+			self.secondsUntilFull or -1, unloaderEstimatedSecondsEnroute, unloaderRendezvousWaypointIx, dToUnloaderRendezvous,
+			self.waypointIxWhenFull or -1)
 
-	if not self.secondsUntilFull or (self.secondsUntilFull and self.secondsUntilFull > unloaderEstimatedSecondsEnroute) then
-		-- unloader will reach us before we are full, or we don't know where we'll be full, guess at which waypoint we will be by then
-		unloaderRendezvousWaypointIx = self:getSafeUnloaderDestinationWaypoint(unloaderRendezvousWaypointIx)
-		if self:canUnloadWhileMovingAtWaypoint(unloaderRendezvousWaypointIx) then
-			self.agreedUnloaderRendezvousWaypointIx = unloaderRendezvousWaypointIx
-			self:debug('Rendezvous with unloader at waypoint %d in %d m', unloaderRendezvousWaypointIx, dToUnloaderRendezvous)
-			return self.fieldworkCourse:getWaypoint(unloaderRendezvousWaypointIx), unloaderRendezvousWaypointIx, unloaderEstimatedSecondsEnroute
-		else
-			return nil, 0, 0
-		end
-	elseif self.waypointIxWhenFull then
-		self:debug('We don\'t know when exactly we\'ll be full, but it will be at waypoint %d in %d m, reject rendezvous',
-				self.waypointIxWhenFull, self.distanceToWaypointWhenFull)
-		if self:canUnloadWhileMovingAtWaypoint(unloaderRendezvousWaypointIx) then
-			self.agreedUnloaderRendezvousWaypointIx = self.waypointIxWhenFull
-			-- TODO: figure out what to do in this case, it does not seem to make sense to send the unloader to
-			-- a distant waypoint
-			return nil, 0, 0
-			-- return self.fieldworkCourse:getWaypoint(self.waypointIxWhenFull), self.waypointIxWhenFull, self.distanceToWaypointWhenFull / (self:getWorkSpeed() / 3.6)
-		else
-			return nil, 0, 0
-		end
+	-- rendezvous at whichever is closer
+	unloaderRendezvousWaypointIx = math.min(unloaderRendezvousWaypointIx, self.waypointIxWhenFull or unloaderRendezvousWaypointIx)
+	-- now check if this is a good idea
+	self.agreedUnloaderRendezvousWaypointIx = self:findBestWaypointToUnload(unloaderRendezvousWaypointIx)
+	if self.agreedUnloaderRendezvousWaypointIx then
+		self.unloadAIDriverToRendezvous:set(unloadAIDriver, 1000 * (unloaderEstimatedSecondsEnroute + 30))
+		self:debug('Rendezvous with unloader at waypoint %d in %d m', self.agreedUnloaderRendezvousWaypointIx, dToUnloaderRendezvous)
+		return self.fieldworkCourse:getWaypoint(self.agreedUnloaderRendezvousWaypointIx),
+			self.agreedUnloaderRendezvousWaypointIx, unloaderEstimatedSecondsEnroute
 	else
-		self:debug('We don\t know when exactly we\'ll be full, reject rendezvous')
+		self:cancelRendezvous()
+		self:debug('Rendezvous with unloader rejected')
 		return nil, 0, 0
 	end
 end
@@ -601,39 +692,11 @@ function CombineAIDriver:canUnloadWhileMovingAtWaypoint(ix)
 		self:debug('pipe would be in fruit at the planned rendezvous waypoint %d', ix)
 		return false
 	end
-	if self.fieldworkCourse:isOnHeadland(ix, 1) then
+	if self.vehicle.cp.settings.allowUnloadOnFirstHeadland:is(false) and self.fieldworkCourse:isOnHeadland(ix, 1) then
 		self:debug('planned rendezvous waypoint %d is on first headland, no unloading of moving combine there', ix)
 		return false
 	end
 	return true
-end
-
---- Check if ix is a safe destination for an unloader, return an adjusted ix if not
----@param ix number waypoint index to check
----@return number waypoint index adjusted if needed
-function CombineAIDriver:getSafeUnloaderDestinationWaypoint(ix)
-	local newWpIx = ix
-	if self.fieldworkCourse:isTurnStartAtIx(ix) then
-		if self.fieldworkCourse:isOnHeadland(ix) then
-			-- on the headland, use the wp after the turn, the one before may be very far, especially on a
-			-- transition from headland to up/down rows.
-			newWpIx = ix + 1
-		else
-			-- turn start waypoints usually aren't safe as they point to the turn end direction in 180 turns
-			-- so use the one before
-			newWpIx = ix - 1
-		end
-	else
-
-	end
-	-- if we ended up on a turn start WP and the row is long enough, move it a bit forward so the unloader does
-	-- not drive much off the field to align with it
-	if self.fieldworkCourse:isTurnStartAtIx(newWpIx) and self.fieldworkCourse:getDistanceToNextTurn(newWpIx) > 20 then
-		-- TODO: get the guess factor out of this (2 wp distance < 20 m)
-		newWpIx = newWpIx + 2
-	end
-
-	return newWpIx
 end
 
 -- TODO: put this in onBlocked()?
@@ -641,11 +704,9 @@ function CombineAIDriver:checkBlockingUnloader()
 	if not self.backwardLookingProximitySensorPack then return end
 	local d, blockingVehicle = self.backwardLookingProximitySensorPack:getClosestObjectDistanceAndRootVehicle()
 	if d < 1000 and blockingVehicle and self:isStopped() and self:isReversing() and not self:isWaitingForUnload() then
-		if g_updateLoopIndex % 250 == 0 then
-			self:debug('Can\'t reverse, %s at %.1f m is blocking', blockingVehicle:getName(), d)
-			if blockingVehicle.cp.driver and blockingVehicle.cp.driver.onBlockingOtherVehicle then
-				blockingVehicle.cp.driver:onBlockingOtherVehicle(self.vehicle)
-			end
+		self:debugSparse('Can\'t reverse, %s at %.1f m is blocking', blockingVehicle:getName(), d)
+		if blockingVehicle.cp.driver and blockingVehicle.cp.driver.onBlockingOtherVehicle then
+			blockingVehicle.cp.driver:onBlockingOtherVehicle(self.vehicle)
 		end
 	end
 end
@@ -668,46 +729,87 @@ function CombineAIDriver:isPipeInFruitAtWaypointNow(course, ix)
 end
 
 --- Find the best waypoint to unload.
----@param waypointIxWhenFull number estimated waypoint index when full based on current fruit flow and distance
----@return number best waypoint to unload. What is a good point to unload:
-function CombineAIDriver:findBestWaypointToUnload(waypointIxWhenFull)
-	if self.course:isOnHeadland(waypointIxWhenFull) then
-		return self:findBestWaypointToUnloadOnHeadland(waypointIxWhenFull)
+---@param ix number waypoint index we want to start unloading, either because that's about where
+--- we'll rendezvous the unloader or we'll be full there.
+---@return number best waypoint to unload, ix may be adjusted to make sure it isn't in a turn or
+--- the fruit is not in the pipe.
+function CombineAIDriver:findBestWaypointToUnload(ix)
+	if self.fieldworkCourse:isOnHeadland(ix) then
+		return self:findBestWaypointToUnloadOnHeadland(ix)
 	else
-		return self:findBestWaypointToUnloadOnUpDownRows(waypointIxWhenFull)
+		return self:findBestWaypointToUnloadOnUpDownRows(ix)
 	end
 end
 
-function CombineAIDriver:findBestWaypointToUnloadOnHeadland(waypointIxWhenFull)
-	return waypointIxWhenFull
+function CombineAIDriver:findBestWaypointToUnloadOnHeadland(ix)
+	if self.vehicle.cp.settings.allowUnloadOnFirstHeadland:is(false) and
+			self.fieldworkCourse:isOnHeadland(ix, 1) then
+		self:debug('planned rendezvous waypoint %d is on first headland, no unloading of moving combine there', ix)
+		return nil
+	end
+	if self.fieldworkCourse:isTurnStartAtIx(ix) then
+		-- on the headland, use the wp after the turn, the one before may be very far, especially on a
+		-- transition from headland to up/down rows.
+		return ix + 1
+	else
+		return ix
+	end
 end
 
-function CombineAIDriver:findBestWaypointToUnloadOnUpDownRows(waypointIxWhenFull)
-	local dToNextTurn = self.course:getDistanceToNextTurn(waypointIxWhenFull) or 0
-	local lRow, ixAtTurnEnd = self.course:getRowLength(waypointIxWhenFull)
-	local pipeInFruit, _ = self:isPipeInFruitAtWaypoint(self.course, waypointIxWhenFull)
-	self:debug('Estimated waypoint when full: %d on up/down row, pipe in fruit %s, dToNextTurn: %d m, lRow = %d m',
-				waypointIxWhenFull, tostring(pipeInFruit), dToNextTurn, lRow or 0)
+--- We calculated a waypoint to meet the unloader (either because it asked for it or we think we'll need
+--- to unload. Now make sure that this location is not around a turn or the pipe isn't in the fruit by
+--- trying to move it up or down a bit. If that's not possible, just leave it and see what happens :)
+function CombineAIDriver:findBestWaypointToUnloadOnUpDownRows(ix)
+	local dToNextTurn = self.fieldworkCourse:getDistanceToNextTurn(ix) or math.huge
+	local lRow, ixAtRowStart = self.fieldworkCourse:getRowLength(ix)
+	local pipeInFruit = self.fieldworkCourse:isPipeInFruitAt(ix)
+	local currentIx = self.fieldworkCourse:getCurrentWaypointIx()
+	local newWpIx = ix
+	self:debug('Looking for a waypoint to unload around %d on up/down row, pipe in fruit %s, dToNextTurn: %d m, lRow = %d m',
+				ix, tostring(pipeInFruit), dToNextTurn, lRow or 0)
 	if pipeInFruit then
-		self:debug('Pipe would be in fruit where we will be full. Check previous row')
-		if ixAtTurnEnd and ixAtTurnEnd > self.course:getCurrentWaypointIx() then
-			pipeInFruit, _ = self:isPipeInFruitAtWaypoint(self.course, ixAtTurnEnd - 1)
-			if not pipeInFruit then
-				local lPreviousRow = self.course:getRowLength(ixAtTurnEnd - 1)
-				self:debug('pipe not in fruit in the previous row (%d m, ending at wp %d), so unload there if long enough',
-						lPreviousRow, ixAtTurnEnd - 1)
-				return ixAtTurnEnd - 3
+		if ixAtRowStart then
+			if ixAtRowStart > currentIx then
+				-- have not started the previous row yet
+				self:debug('Pipe would be in fruit at waypoint %d. Check previous row', ix)
+				pipeInFruit, _ = self.fieldworkCourse:isPipeInFruitAt(ixAtRowStart - 2) -- wp before the turn start
+				if not pipeInFruit then
+					local lPreviousRow, ixAtPreviousRowStart = self.fieldworkCourse:getRowLength(ixAtRowStart - 1)
+					self:debug('pipe not in fruit in the previous row (%d m, ending at wp %d), rendezvous at %d',
+							lPreviousRow, ixAtRowStart - 1, newWpIx)
+					newWpIx = math.max(ixAtRowStart - 3, ixAtPreviousRowStart, currentIx)
+				else
+					self:debug('Pipe in fruit in previous row too, rejecting rendezvous')
+					newWpIx = nil
+				end
+			else
+				-- previous row already started. Could check next row but that means the rendezvous would be after
+				-- the combine turns, and we'd be in the way during the turn, so rather not worry about the next row
+				-- until the combine gets there.
+				self:debug('Pipe would be in fruit at waypoint %d. Previous row is already started, no rendezvous', ix)
+				newWpIx = nil
 			end
+		else
+			self:debug('Could not determine row length, rejecting rendezvous')
+			newWpIx = nil
 		end
 	else
-		self:debug('pipe is not in fruit where we are full. If it is towards the end of the row, bring it up a bit')
+		self:debug('pipe is not in fruit at %d. If it is towards the end of the row, bring it up a bit', ix)
 		-- so we'll have some distance for unloading
-		if ixAtTurnEnd and dToNextTurn < lRow / 2 then
-			return ixAtTurnEnd + 1
+		if ixAtRowStart and dToNextTurn < CombineAIDriver.safeUnloadDistanceBeforeEndOfRow then
+			local safeIx = self.fieldworkCourse:getPreviousWaypointIxWithinDistance(ix,
+					CombineAIDriver.safeUnloadDistanceBeforeEndOfRow)
+			newWpIx = math.max(ixAtRowStart + 1, safeIx or -1, ix - 4)
 		end
 	end
-	-- no better idea, just use the original estimated
-	return waypointIxWhenFull
+	-- no better idea, just use the original estimated, making sure we avoid turn start waypoints
+	if newWpIx and self.fieldworkCourse:isTurnStartAtIx(newWpIx) then
+		self:debug('Calculated rendezvous waypoint is at turn start, moving it up')
+		-- make sure it is not on the turn start waypoint
+		return math.max(newWpIx - 1, currentIx)
+	else
+		return newWpIx
+	end
 end
 
 function CombineAIDriver:updateLightsOnField()
@@ -846,6 +948,14 @@ function CombineAIDriver:isWaitingForUnloadAfterCourseEnded()
 		self.fieldworkUnloadOrRefillState == self.states.WAITING_FOR_UNLOAD_AFTER_FIELDWORK_ENDED
 end
 
+--- Interface for Mode 2
+---@return boolean true when the combine is waiting to after it pulled back.
+function CombineAIDriver:isWaitingForUnloadAfterPulledBack()
+	return self.state == self.states.ON_FIELDWORK_COURSE and
+			self.fieldworkState == self.states.UNLOAD_OR_REFILL_ON_FIELD and
+			self.fieldworkUnloadOrRefillState == self.states.WAITING_FOR_UNLOAD_AFTER_PULLED_BACK
+end
+
 function CombineAIDriver:createTurnCourse()
 	return CombineCourseTurn(self.vehicle, self, self.turnContext, self.fieldworkCourse)
 end
@@ -864,7 +974,7 @@ function CombineAIDriver:startTurn(ix)
 
 	self:setMarkers()
 	self.turnContext = TurnContext(self.course, ix, self.aiDriverData, self.vehicle.cp.workWidth, self.frontMarkerDistance,
-			self:getTurnEndSideOffset())
+			self:getTurnEndSideOffset(), self:getTurnEndForwardOffset())
 
 	-- Combines drive special headland corner maneuvers, except potato and sugarbeet harvesters
 	if self.turnContext:isHeadlandCorner() then
@@ -872,7 +982,11 @@ function CombineAIDriver:startTurn(ix)
 			self:debug('Headland turn but this harvester uses normal turn maneuvers.')
 			self.turnType = self.turnTypes.HEADLAND_NORMAL
 			UnloadableFieldworkAIDriver.startTurn(self, ix)
-		elseif self.course:isOnOutermostHeadland(ix) and self.vehicle.cp.turnOnField then
+		elseif self.course:isOnConnectingTrack(ix) then
+			self:debug('Headland turn but this a connecting track, use normal turn maneuvers.')
+			self.turnType = self.turnTypes.HEADLAND_NORMAL
+			UnloadableFieldworkAIDriver.startTurn(self, ix)
+		elseif self.course:isOnOutermostHeadland(ix) and self.vehicle.cp.settings.turnOnField:is(true) then
 			self:debug('Creating a pocket in the corner so the combine stays on the field during the turn')
 			self.aiTurn = CombinePocketHeadlandTurn(self.vehicle, self, self.turnContext, self.fieldworkCourse)
 			self.turnType = self.turnTypes.HEADLAND_POCKET
@@ -889,9 +1003,6 @@ function CombineAIDriver:startTurn(ix)
 		self.turnType = self.turnTypes.UP_DOWN_NORMAL
 		UnloadableFieldworkAIDriver.startTurn(self, ix)
 	end
-
-	self:sendTurnStartEventToUnloaders(ix, self.turnType)
-
 end
 
 function CombineAIDriver:isTurning()
@@ -931,6 +1042,7 @@ end
 function CombineAIDriver:getWorkWidth()
 	return self.vehicle.cp.workWidth
 end
+
 
 --- Create a pocket in the next row at the corner to stay on the field during the turn maneuver.
 ---@param turnContext TurnContext
@@ -999,7 +1111,8 @@ function CombineAIDriver:handlePipe()
 end
 
 function CombineAIDriver:handleCombinePipe()
-	if self:isFillableTrailerUnderPipe() or self:isAutoDriveWaitingForPipe() or (self:isWaitingForUnload() and self.vehicle.cp.settings.pipeAlwaysUnfold:is(true)) then
+    
+  if self:isFillableTrailerUnderPipe() or self:isAutoDriveWaitingForPipe() or (self:isWaitingForUnload() and self.vehicle.cp.settings.pipeAlwaysUnfold:is(true)) then
 		self:openPipe()
 	else
 		--wait until the objects under the pipe are gone
@@ -1059,20 +1172,25 @@ end
 
 function CombineAIDriver:openPipe()
 	if not self:needToOpenPipe() then return end
-	if self.pipe.currentState ~= CombineAIDriver.PIPE_STATE_MOVING and
-		self.pipe.currentState ~= CombineAIDriver.PIPE_STATE_OPEN then
+	if self.pipe.currentState ~= AIDriverUtil.PIPE_STATE_MOVING and
+		self.pipe.currentState ~= AIDriverUtil.PIPE_STATE_OPEN then
 		self:debug('Opening pipe')
-		self.objectWithPipe:setPipeState(self.PIPE_STATE_OPEN)
+		self.objectWithPipe:setPipeState(AIDriverUtil.PIPE_STATE_OPEN)
 	end
 end
 
 function CombineAIDriver:closePipe()
 	if not self:needToOpenPipe() then return end
-	if self.pipe.currentState ~= CombineAIDriver.PIPE_STATE_MOVING and
-		self.pipe.currentState ~= CombineAIDriver.PIPE_STATE_CLOSED then
+	if self.pipe.currentState ~= AIDriverUtil.PIPE_STATE_MOVING and
+		self.pipe.currentState ~= AIDriverUtil.PIPE_STATE_CLOSED then
 		self:debug('Closing pipe')
-		self.objectWithPipe:setPipeState(self.PIPE_STATE_CLOSED)
+		self.objectWithPipe:setPipeState(AIDriverUtil.PIPE_STATE_CLOSED)
 	end
+end
+
+function CombineAIDriver:isPipeMoving()
+	if not self:needToOpenPipe() then return end
+	return self.pipe.currentState == AIDriverUtil.PIPE_STATE_MOVING
 end
 
 function CombineAIDriver:shouldStopForUnloading(pc)
@@ -1120,6 +1238,14 @@ function CombineAIDriver:canLoadTrailer(trailer)
 	return false, 0
 end
 
+function CombineAIDriver:getFillType()
+	local dischargeNode = self.objectWithPipe:getDischargeNodeByIndex(self.objectWithPipe:getPipeDischargeNodeIndex())
+	if dischargeNode then
+		return self.objectWithPipe:getFillUnitFillType(dischargeNode.fillUnitIndex)
+	end
+	return nil
+end
+
 -- even if there is a trailer in range, we should not start moving until the pipe is turned towards the
 -- trailer and can start discharging. This returning true does not mean there's a trailer under the pipe,
 -- this seems more like for choppers to check if there's a potential target around
@@ -1161,15 +1287,16 @@ function CombineAIDriver:findBestTrailer()
 			if SpecializationUtil.hasSpecialization(Attachable, vehicle.specializations) then
 				attacherVehicle = vehicle.spec_attachable:getAttacherVehicle()
 			end
-			local fieldNum = courseplay.fields:onWhichFieldAmI(vehicle)
-			local myFieldNum = courseplay.fields:onWhichFieldAmI(self.vehicle)
+			local fieldNum = PathfinderUtil.getFieldNumUnderVehicle(vehicle)
+			local myFieldNum = PathfinderUtil.getFieldNumUnderVehicle(self.vehicle)
 			local x, _, z = getWorldTranslation(vehicle.rootNode)
 			local closestDistance = courseplay.fields:getClosestDistanceToFieldEdge(myFieldNum, x, z)
 			local lastSpeed = rootVehicle:getLastSpeed()
 			self:debug('%s is a trailer on field %d, closest distance to %d is %.1f, attached to %s, root vehicle is %s, last speed %.1f', vehicle:getName(),
 					fieldNum, myFieldNum, closestDistance, attacherVehicle and attacherVehicle:getName() or 'none', rootVehicle:getName(), lastSpeed)
 			-- consider only trailer on my field or close to my field
-			if fieldNum == myFieldNum or myFieldNum == 0 or closestDistance < 20 and lastSpeed < 0.1 then
+			if rootVehicle ~= self.vehicle and fieldNum == myFieldNum or myFieldNum == 0 or
+					closestDistance < 20 and lastSpeed < 0.1 then
 				local d = courseplay:distanceToObject(self.vehicle, vehicle)
 				local canLoad, freeCapacity, fillUnitIndex = self:canLoadTrailer(vehicle)
 				if d < minDistance and canLoad then
@@ -1227,10 +1354,22 @@ function CombineAIDriver:startSelfUnload()
 		self.pathfindingStartedAt = self.vehicle.timer
 		self.courseAfterPathfinding = nil
 		self.waypointIxAfterPathfinding = nil
-		local fieldNum = courseplay.fields:onWhichFieldAmI(self.vehicle)
+		local targetNode = fillRootNode or bestTrailer.rootNode
+		local offsetX = -self.pipeOffsetX - 0.2
+		local alignLength = 3
+		-- arrive near the trailer alignLength meters behind the target, from there, continue straight a bit
+		local offsetZ = -self.pipeOffsetZ - alignLength
+		-- little straight section parallel to the trailer to align better
+		self.selfUnloadAlignCourse = Course.createFromNode(self.vehicle, targetNode,
+				offsetX, offsetZ + 1, offsetZ + 1 + alignLength, 1, false)
+
+	local fieldNum = PathfinderUtil.getFieldNumUnderVehicle(self.vehicle)
 		local done, path
+		-- require full accuracy from pathfinder as we must exactly line up with the trailer
 		self.pathfinder, done, path = PathfinderUtil.startPathfindingFromVehicleToNode(
-				self.vehicle, fillRootNode or bestTrailer.rootNode, -self.pipeOffsetX - 0.2, -self.pipeOffsetZ, true, fieldNum)
+				self.vehicle, targetNode, offsetX, offsetZ,
+				self:getAllowReversePathfinding(),
+				fieldNum, {}, nil, nil, true)
 		if done then
 			return self:onPathfindingDone(path)
 		else
@@ -1248,9 +1387,11 @@ function CombineAIDriver:returnToFieldworkAfterSelfUnloading()
 		self.pathfindingStartedAt = self.vehicle.timer
 		self.courseAfterPathfinding = self.fieldworkCourse
 		self.waypointIxAfterPathfinding = self.aiDriverData.continueFieldworkAtWaypoint
+		self.selfUnloadAlignCourse = nil
 		local done, path
 		self.pathfinder, done, path = PathfinderUtil.startPathfindingFromVehicleToWaypoint(
-				self.vehicle, self.fieldworkCourse:getWaypoint(self.waypointIxAfterPathfinding), 0,0,true, nil)
+				self.vehicle, self.fieldworkCourse:getWaypoint(self.waypointIxAfterPathfinding), 0,0,
+				self:getAllowReversePathfinding(), nil)
 		if done then
 			return self:onPathfindingDone(path)
 		else
@@ -1262,10 +1403,15 @@ function CombineAIDriver:returnToFieldworkAfterSelfUnloading()
 	return true
 end
 
+-- TODO: split this into two, depending on the call location, like in mode 2
 function CombineAIDriver:onPathfindingDone(path)
 	if path and #path > 2 then
 		self:debug('(CombineAIDriver) Pathfinding finished with %d waypoints (%d ms)', #path, self.vehicle.timer - (self.pathfindingStartedAt or 0))
 		local selfUnloadCourse = Course(self.vehicle, courseGenerator.pointsToXzInPlace(path), true)
+		if self.selfUnloadAlignCourse then
+			selfUnloadCourse:append(self.selfUnloadAlignCourse)
+			self.selfUnloadAlignCourse = nil
+		end
 		self:startCourse(selfUnloadCourse, 1, self.courseAfterPathfinding, self.waypointIxAfterPathfinding)
 		return true
 	else
@@ -1291,7 +1437,7 @@ end
 --- events are for the low level coordination between the combine and its unloader(s). CombineUnloadManager
 --- takes care about coordinating the work between multiple combines.
 function CombineAIDriver:clearAllUnloaderInformation()
-	self.agreedUnloaderRendezvousWaypointIx = nil
+	self:cancelRendezvous()
 	-- the unloaders table hold all registered unloaders, key and value are both the unloader AIDriver
 	self.unloaders = {}
 end
@@ -1299,19 +1445,19 @@ end
 --- Register a combine unload AI driver for notification about combine events
 --- Unloaders can renew their registration as often as they want to make sure they remain registered.
 ---@param driver CombineUnloadAIDriver
-function CombineAIDriver:registerUnloader(driver)
+function CombineAIDriver:registerUnloader(driver,noEventSend)
 	self.unloaders[driver] = driver
+	if not noEventSend then 
+		UnloaderEvents:sendRegisterUnloaderEvent(driver,self)
+	end
 end
 
 --- Deregister a combine unload AI driver from notificiations
 ---@param driver CombineUnloadAIDriver
-function CombineAIDriver:deregisterUnloader(driver)
+function CombineAIDriver:deregisterUnloader(driver,noEventSend)
 	self.unloaders[driver] = nil
-end
-
-function CombineAIDriver:sendTurnStartEventToUnloaders(ix, turnType)
-	for _, unloader in pairs(self.unloaders) do
-		if unloader then unloader:onCombineTurnStart(ix, turnType) end
+	if not noEventSend then 
+		UnloaderEvents:sendDeregisterUnloaderEvent(driver,self)
 	end
 end
 
@@ -1323,6 +1469,25 @@ function CombineAIDriver:fixDischargeDistance(dischargeNode)
 			self:debug('Chopper maximum throw distance is %.1f, increasing to %.1f', dischargeNode.maxDistance, safeDischargeNodeMaxDistance)
 			dischargeNode.maxDistance = safeDischargeNodeMaxDistance
 		end
+	end
+end
+
+--- Make life easier for unloaders, increases reach of the pipe
+function CombineAIDriver:fixMaxRotationLimit()
+	local LastPipeNode = self.pipe.nodes and self.pipe.nodes[#self.pipe.nodes]
+	if self:isChopper() and LastPipeNode and LastPipeNode.maxRotationLimits then
+		self.oldLastPipeNodeMaxRotationLimit = LastPipeNode.maxRotationLimits
+        self:debug('Chopper fix maxRotationLimits, old Values: x=%s, y= %s, z =%s', tostring(LastPipeNode.maxRotationLimits[1]), tostring(LastPipeNode.maxRotationLimits[2]), tostring(LastPipeNode.maxRotationLimits[3]))
+        LastPipeNode.maxRotationLimits = nil   
+    end
+end
+
+function CombineAIDriver:resetFixMaxRotationLimit()
+	local LastPipeNode = self.pipe.nodes and self.pipe.nodes[#self.pipe.nodes]
+	if LastPipeNode and self.oldLastPipeNodeMaxRotationLimit then 
+		LastPipeNode.maxRotationLimits = self.oldLastPipeNodeMaxRotationLimit
+		self:debug('Chopper: reset maxRotationLimits is x=%s, y= %s, z =%s', tostring(LastPipeNode.maxRotationLimits[1]), tostring(LastPipeNode.maxRotationLimits[3]), tostring(LastPipeNode.maxRotationLimits[3]))
+		self.oldLastPipeNodeMaxRotationLimit = nil
 	end
 end
 
@@ -1352,13 +1517,15 @@ function CombineAIDriver:initUnloadStates()
 		self.states.WAITING_FOR_UNLOAD_AFTER_FIELDWORK_ENDED,
 		self.states.WAITING_FOR_UNLOAD_OR_REFILL,
 		self.states.WAITING_FOR_UNLOAD_AFTER_PULLED_BACK,
-		self.states.WAITING_FOR_UNLOAD_IN_POCKET
+		self.states.WAITING_FOR_UNLOAD_IN_POCKET,
+		self.states.WAITING_FOR_UNLOAD_BEFORE_STARTING_NEXT_ROW
 	}
 
 	self.willWaitForUnloadToFinishFieldworkStates = {
 		self.states.WAITING_FOR_UNLOAD_AFTER_PULLED_BACK,
 		self.states.WAITING_FOR_UNLOAD_IN_POCKET,
 		self.states.WAITING_FOR_UNLOAD_AFTER_FIELDWORK_ENDED,
+		self.states.WAITING_FOR_UNLOAD_BEFORE_STARTING_NEXT_ROW
 	}
 end
 
@@ -1382,6 +1549,24 @@ function CombineAIDriver:isFieldworkUnloadOrRefillStateOneOf(states)
 	return self:isStateOneOf(self.fieldworkUnloadOrRefillState, states)
 end
 
+-- TODO: this whole logic is more relevant to the unloader maybe move it there?
+function CombineAIDriver:getClosestFieldworkWaypointIx()
+	if self:isTurning() then
+		if self.turnContext then
+			-- send turn start wp, unloader will decide if it needs to move it to the turn end or not
+			return self.turnContext.turnStartWpIx
+		else
+			-- if for whatever reason we don't have a turn context, current waypoint is ok
+			return self.fieldworkCourse:getCurrentWaypointIx()
+		end
+	elseif self.course:isTemporary() then
+		return self.fieldworkCourse:getLastPassedWaypointIx()
+	else
+		-- if currently on the fieldwork course, this is the best estimate
+		return self:getRelevantWaypointIx()
+	end
+end
+
 --- Maneuvering means turning or working on a pocket or pulling back due to the pipe in fruit
 --- We don't want to get too close to a maneuvering combine until it is done
 function CombineAIDriver:isManeuvering()
@@ -1393,24 +1578,45 @@ function CombineAIDriver:isManeuvering()
 			)
 end
 
+function CombineAIDriver:isOnHeadland(n)
+	return self.state == self.states.ON_FIELDWORK_COURSE and
+			self.fieldworkCourse:isOnHeadland(self.fieldworkCourse:getCurrentWaypointIx(), n)
+end
+
 --- Are we ready for an unloader?
-function CombineAIDriver:isReadyToUnload()
+--- @param noUnloadWithPipeInFruit boolean pipe must not be in fruit for unload
+function CombineAIDriver:isReadyToUnload(noUnloadWithPipeInFruit)
 	-- no unloading when not in a safe state (like turning)
-	-- in this states we are always ready
+	-- in these states we are always ready
 	if self:willWaitForUnloadToFinish() then return true end
+
+	-- but, if we are full and waiting for unload, we have no choice, we must be ready ...
+	if self.state == self.states.ON_FIELDWORK_COURSE and
+			self.fieldworkState == self.states.UNLOAD_OR_REFILL_ON_FIELD and
+			self.fieldworkUnloadOrRefillState == self.states.WAITING_FOR_UNLOAD_OR_REFILL then
+		return true
+	end
+
 	-- pipe is in the fruit.
-	if self:isPipeInFruit() then return false end
-	if not self.fieldworkCourse then return false end
-    -- around a turn, for example already working on the next row but not done with the turn yet
-    local lastIx = self.fieldworkCourse:getLastPassedWaypointIx()
-	if lastIx then
-		local dToNextTurn = self.fieldworkCourse:getDistanceToNextTurn(lastIx)
-		-- if distance to last turn is not known then we are ok. If it is known and the turn
-		-- is close, we aren't ready.
-		return dToNextTurn and dToNextTurn < 10 or true
-	else
+	if noUnloadWithPipeInFruit and self:isPipeInFruit() then
+		self:debugSparse('isReadyToUnload(): pipe in fruit')
 		return false
 	end
+
+	if not self.fieldworkCourse then
+		self:debugSparse('isReadyToUnload(): has no fieldwork course')
+		return false
+	end
+
+    -- around a turn, for example already working on the next row but not done with the turn yet
+
+	if self.fieldworkCourse:isCloseToNextTurn(10) then
+		self:debugSparse('isReadyToUnload(): too close to turn')
+		return false
+	end
+	-- safe default, better than block unloading
+	self:debugSparse('isReadyToUnload(): defaulting to ready to unload')
+	return true
 end
 
 --- Will not move until unload is done? Unloaders like to know this.
@@ -1424,20 +1630,20 @@ function CombineAIDriver:willWaitForUnloadToFinish()
 end
 
 function CombineAIDriver:shouldStrawSwathBeOn(ix)
-	local strawSwath = self.combine.isSwathActive 
-	local headlandStraw = self.vehicle.cp.settings.strawOnHeadland:is(true)
+	local strawMode = self.vehicle.cp.settings.strawSwath:get()
 	local headland = self.course:isOnHeadland(ix)
-
-	-- Do not check headland or set swath if combine is set to no swath
-	if strawSwath then
-		if not headland or (headland and headlandStraw) then
-			strawSwath = true
-		else
-			strawSwath = false
+	if self.combine.isSwathActive then 
+		if strawMode == StrawSwathSetting.OFF or headland and strawMode==StrawSwathSetting.ONLY_CENTER then 
+			self:setStrawSwath(false)
 		end
-
-		self:setStrawSwath(strawSwath)
-	end
+	else
+		if strawMode > StrawSwathSetting.OFF then 
+			if headland and strawMode==StrawSwathSetting.ONLY_CENTER then 
+				return
+			end
+			self:setStrawSwath(true)
+		end
+	end	
 end
 
 CombineAIDriver.maxBackDistance = 10
@@ -1451,8 +1657,8 @@ end
 function CombineAIDriver:measureBackDistance()
 	self.measuredBackDistance = 0
 	-- raycast from a point behind the vehicle forward towards the direction node
-	local nx, ny, nz = localDirectionToWorld(self:getDirectionNode(), 0, 0, 1)
-	local x, y, z = localToWorld(self:getDirectionNode(), 0, 1.5, - self.maxBackDistance)
+	local nx, ny, nz = localDirectionToWorld(self.vehicle.rootNode, 0, 0, 1)
+	local x, y, z = localToWorld(self.vehicle.rootNode, 0, 1.5, - self.maxBackDistance)
 	raycastAll(x, y, z, nx, ny, nz, 'raycastBackCallback', self.maxBackDistance, self)
 end
 
@@ -1471,7 +1677,6 @@ function CombineAIDriver:raycastBackCallback(hitObjectId, x, y, z, distance, nx,
 		end
 	end
 end
-
 
 function CombineAIDriver:setStrawSwath(enable)
 	local strawSwathCanBeEnabled = false
@@ -1494,6 +1699,55 @@ function CombineAIDriver:onDraw()
 		DebugUtil.drawDebugNode(dischargeNode.node, 'discharge')
 	end
 
+	if self.aiDriverData.backMarkerNode then
+		DebugUtil.drawDebugNode(self.aiDriverData.backMarkerNode, 'back marker')
+	end
+
 	UnloadableFieldworkAIDriver.onDraw(self)
 end
 
+-- For combines, we use the collision trigger of the header to cover the whole vehicle width
+function CombineAIDriver:createTrafficConflictDetector()
+	-- (not everything running as combine has a cutter, for instance the Krone Premos)
+	if self.combine.attachedCutters then
+		for cutter, _ in pairs(self.combine.attachedCutters) do
+			-- attachedCutters is indexed by the cutter, not an integer
+			self.trafficConflictDetector = TrafficConflictDetector(self.vehicle, self.course, cutter)
+			-- for now, combines ignore traffic conflicts (but still provide the detector boxes for other vehicles)
+			self.trafficConflictDetector:disableSpeedControl()
+			return
+		end
+	end
+	self.trafficConflictDetector = TrafficConflictDetector(self.vehicle, self.course)
+	-- for now, combines ignore traffic conflicts (but still provide the detector boxes for other vehicles)
+	self.trafficConflictDetector:disableSpeedControl()
+end
+
+-- and our forward proximity sensor covers the entire working width
+function CombineAIDriver:addForwardProximitySensor()
+	self:setFrontMarkerNode(self.vehicle)
+	self.forwardLookingProximitySensorPack = WideForwardLookingProximitySensorPack(
+			self.vehicle, self.ppc, self:getFrontMarkerNode(self.vehicle), self.proximitySensorRange, 1, self.vehicle.cp.workWidth)
+end
+
+--- Check the vehicle in the proximity sensor's range. If it is player driven, don't slow them down when hitting this
+--- vehicle.
+--- Note that we don't really know if the player is to unload the combine, this will disable all proximity check for
+--- player driven vehicles.
+function CombineAIDriver:isProximitySlowDownEnabled(vehicle)
+	-- if not on fieldwork, always enable slowing down
+	if self.state ~= self.states.ON_FIELDWORK_COURSE then return true end
+
+	-- CP drives other vehicle, it'll take care of everything, including enable/disable
+	-- the proximity sensor when unloading
+	if vehicle.cp.driver and vehicle.cp.driver.isActive and vehicle.cp.driver:isActive() then return true end
+
+	-- vehicle:getIsControlled() is needed as this one gets synchronized 
+	if vehicle and (vehicle:getIsEntered() or vehicle:getIsControlled()) then
+		self:debugSparse('human player in nearby %s not driven by CP so do not slow down for it', nameNum(vehicle))
+		-- trust the player to avoid collisions
+		return false
+	else
+		return true
+	end
+end

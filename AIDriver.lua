@@ -119,8 +119,17 @@ AIDriver.proximitySensorRange = 10
 -- the sensor will proportionally reduce speed when objects are in range down to this limit (won't set a speed lower than this)
 AIDriver.proximityMinLimitedSpeed = 2
 -- if anything closer than this, we stop
-AIDriver.proximityLimitLow = 1
+AIDriver.proximityLimitLow = 1.5
+-- if anything closer than this, we reverse
+AIDriver.proximityLimitReverse = 1
+-- an obstacle is considered ahead of us if the reported angle is less then this
+-- (and we won't stop or reverse if the angle is higher than this, thus obstacles to the left or right)
+AIDriver.proximityAngleAheadDeg = 45
+-- default slow down distance before last waypoint
+AIDriver.defaultSlowDownDistanceBeforeLastWaypoint = 15
 
+AIDriver.APPROACH_AUGER_TRIGGER_SPEED = 3
+AIDriver.EMERGENCY_BRAKE_FORCE = 1000000
 -- we use this as an enum
 AIDriver.myStates = {
 	TEMPORARY = {}, -- Temporary course, dynamically generated, for example alignment or fruit avoidance
@@ -132,7 +141,7 @@ AIDriver.myStates = {
 --- Create a new driver (usage: aiDriver = AIDriver(vehicle)
 -- @param vehicle to drive. Will set up a course to drive from vehicle.Waypoints
 function AIDriver:init(vehicle)
-	courseplay.debugVehicle(11,vehicle,'AIDriver:init()') 
+	courseplay.debugVehicle(11,vehicle,'AIDriver:init()')
 	self.debugChannel = 14
 	self.mode = courseplay.MODE_TRANSPORT
 	self.states = {}
@@ -161,6 +170,7 @@ function AIDriver:init(vehicle)
 	-- if someone wants to stop by calling hold()
 	self.allowedToDrive = true
 	self.collisionDetectionEnabled = true
+	self.trafficConflictDetectionEnabled = true
 	self.collisionDetector = nil
 	-- list of active messages to display
 	self.activeMsgReferences = {}
@@ -170,15 +180,63 @@ function AIDriver:init(vehicle)
 		self.vehicle.cp.settings:validateCurrentValues()
 	end
 	self:setHudContent()
+	self.triggerHandler = TriggerHandler(self,self.vehicle,self:getSiloSelectedFillTypeSetting())
+	self.triggerHandler:enableFuelLoading()
 end
 
-function AIDriver:writeUpdateStream(streamId)
-	streamWriteString(streamId,self.state.name)
+function AIDriver:updateLoadingText()
+	local fillableObject = self.triggerHandler.fillableObject
+	if fillableObject then
+		local fillLevel = fillableObject.object:getFillUnitFillLevel(fillableObject.fillUnitIndex)
+		local fillCapacity = fillableObject.object:getFillUnitCapacity(fillableObject.fillUnitIndex)
+		if fillLevel and fillCapacity then
+			if fillableObject.isLoading then 
+				courseplay:setInfoText(self.vehicle, string.format("COURSEPLAY_LOADING_AMOUNT;%d;%d",math.floor(fillLevel),fillCapacity))
+			else
+				courseplay:setInfoText(self.vehicle, string.format("COURSEPLAY_UNLOADING_AMOUNT;%d;%d",math.floor(fillLevel),fillCapacity))
+			end
+		end
+	end
+end
+
+function AIDriver:writeUpdateStream(streamId, connection, dirtyMask)
+	self.triggerHandler:writeUpdateStream(streamId)
+	if self.state ~= self.stateSend then 
+		streamWriteBool(streamId,true)
+		streamWriteString(streamId,self.state.name)
+		self.stateSend = self.state
+	else 
+		streamWriteBool(streamId,false)
+	end
+	if self.active ~= self.activeSend then 
+		streamWriteBool(streamId,true)
+		streamWriteBool(streamId,self.active or false)
+		self.activeSend = self.active
+	else
+		streamWriteBool(streamId,false)
+	end
 end 
 
-function AIDriver:readUpdateStream(streamId)
+function AIDriver:readUpdateStream(streamId, timestamp, connection)
+	self.triggerHandler:readUpdateStream(streamId)
+	if streamReadBool(streamId) then
+		local nameState = streamReadString(streamId)
+		self.state = self.states[nameState]
+	end
+	if streamReadBool(streamId) then
+		self.active = streamReadBool(streamId)
+	end
+end
+
+function AIDriver:onWriteStream(streamId)
+	streamWriteString(streamId,self.state.name)
+	streamWriteBool(streamId,self.active or false)
+end
+
+function AIDriver:onReadStream(streamId)
 	local nameState = streamReadString(streamId)
 	self.state = self.states[nameState]
+	self.active = streamReadBool(streamId)
 end
 
 function AIDriver:setHudContent()
@@ -201,8 +259,8 @@ end
 
 --- Aggregation of states from this and all descendant classes
 function AIDriver:initStates(states)
-	for key, _ in pairs(states) do
-		self.states[key] = {name = tostring(key)}
+	for key, state in pairs(states) do
+		self.states[key] = {name = tostring(key), properties = state}
 	end
 end
 
@@ -218,12 +276,11 @@ function AIDriver:beforeStart()
 	if self.collisionDetector == nil then
 		self.collisionDetector = CollisionDetector(self.vehicle)
 	end
-
+	self.normalBrakeForce = self.vehicle.spec_motorized.brakeForce
 	self:setBackMarkerNode(self.vehicle)
 	self:setFrontMarkerNode(self.vehicle)
 
 	self:startEngineIfNeeded()
-	self:initWages()
 	self.firstReversingWheeledWorkTool = courseplay:getFirstReversingWheeledWorkTool(self.vehicle)
 	-- for now, pathfinding generated courses can't be driven by towed tools
 	self.allowReversePathfinding = self.firstReversingWheeledWorkTool == nil
@@ -233,20 +290,28 @@ function AIDriver:beforeStart()
 		-- is in aiTrafficCollisionTranslation, if you do a setTranslation() it won't remain there...
 		self.vehicle.spec_aiVehicle.aiTrafficCollisionTranslation[2] = -1000
 	end
+	self.triggerHandler:onStart()
+	self:createTrafficConflictDetector()
+	-- add a proximity sensor to the front by default
+	self:addForwardProximitySensor()
+	self:enableProximitySpeedControl()
+	self:enableProximitySwerve()
 end
 
 --- Start driving
 --- @param startingPoint number, one of StartingPointSetting.START_AT_* constants
 function AIDriver:start(startingPoint)
 	self:beforeStart()
+	self.vehicle.cp.settings.stopAtEnd:set(true)
 	self.state = self.states.RUNNING
-	-- derived classes must disable collision detection if they don't need its
+	-- derived classes must disable collision detection if they don't need it
 	self:enableCollisionDetection()
 	-- for now, initialize the course with the vehicle's current course
 	-- main course is the one generated/loaded/recorded
 	self.mainCourse = Course(self.vehicle, self.vehicle.Waypoints)
 	local ix = self.mainCourse:getStartingWaypointIx(AIDriverUtil.getDirectionNode(self.vehicle), startingPoint)
-	self:debug('AI driver in mode %d starting at %d/%d waypoints', self:getMode(), ix, self.mainCourse:getNumberOfWaypoints())
+	self:info('AI driver in mode %d starting at %d/%d waypoints (%s)',
+			self:getMode(), ix, self.mainCourse:getNumberOfWaypoints(), tostring(startingPoint))
 	self:startCourseWithAlignment(self.mainCourse, ix)
 end
 
@@ -255,11 +320,14 @@ function AIDriver:dismiss()
 	if self.collisionDetector then
 		self.collisionDetector:reset()		-- restore the default direction of the colli boxes
 	end
-	self:resetTrafficControl()
 	self.vehicle:setBeaconLightsVisibility(false)
 	self:clearAllInfoTexts()
 	self:stop()
 	self.active = false
+	if self.trafficConflictDetector then
+		self.trafficConflictDetector:delete()
+		self.trafficConflictDetector = nil
+	end
 end
 
 --- Is the driver started?
@@ -271,6 +339,7 @@ end
 --- @param msgReference string as defined in globalInfoText.msgReference
 function AIDriver:stop(msgReference)
 	self:deleteCollisionDetector()
+	self.triggerHandler:onStop()
 	-- not much to do here, see the derived classes
 	self:setInfoText(msgReference)
 	self.state = self.states.STOPPED
@@ -287,6 +356,7 @@ end
 function AIDriver:continue()
 	self:debug('Continuing...')
 	self.state = self.states.RUNNING
+	self.triggerHandler:onContinue()
 	-- can be stopped for various reasons and those can have different msgReferences, so
 	-- just remove all, if there's a condition which requires a message it'll call setInfoText() again anyway.
 	self:clearAllInfoTexts()
@@ -332,13 +402,24 @@ end
 
 --- Update AI driver, everything that needs to run in every loop
 function AIDriver:update(dt)
-	self:updateProximitySensors()
 	self:updatePathfinding()
 	self:drive(dt)
 	self:checkIfBlocked()
-	self:payWages(dt)
 	self:detectSlipping()
 	self:resetSpeed()
+	self:updateLoadingText()
+	self.triggerHandler:onUpdate(dt)
+	self:shouldDriverBeReleased()
+end
+
+--- UpdateTick AI driver
+function AIDriver:updateTick(dt)
+	self.triggerHandler:onUpdateTick(dt)
+end
+
+--check if we should stop Driver completely
+function AIDriver:shouldDriverBeReleased()
+	--override from FieldWorkAIDriver
 end
 
 --- Main driving function
@@ -353,11 +434,10 @@ function AIDriver:drive(dt)
 
 	self:updateInfoText()
 
-	if self.state == self.states.STOPPED then
+	if self.state == self.states.STOPPED or self.triggerHandler:isLoading() or self.triggerHandler:isUnloading() then
 		self:hold()
 		self:continueIfWaitTimeIsOver()
 	end
-
 	self:driveCourse(dt)
 	self:drawTemporaryCourse()
 end
@@ -366,10 +446,9 @@ end
 -- to reverse with trailer.
 function AIDriver:driveCourse(dt)
 	self:updateLights()
-	-- check if reversing
-	local lx, lz, moveForwards, isReverseActive = self:getReverseDrivingDirection()
+
 	-- stop for fuel if needed
-	if not courseplay:checkFuel(self.vehicle, lx, lz, true) then
+	if not self:isFuelLevelOk() then
 		self:hold()
 	end
 
@@ -386,21 +465,27 @@ function AIDriver:driveCourse(dt)
 		self:setSpeed(self:getRecordedSpeed())
 	end
 
-	if self:getIsInFilltrigger() then
+	local isInTrigger, isAugerWagonTrigger = self.triggerHandler:isInTrigger()
+--	if self:getIsInFilltrigger() or self:hasTipTrigger() then-- or isInTrigger then
+	if isInTrigger then
 		self:setSpeed(self.vehicle.cp.speeds.approach)
+		if isAugerWagonTrigger then
+			self:setSpeed(self.APPROACH_AUGER_TRIGGER_SPEED)
+		end
 	end
 
 	self:slowDownForWaitPoints()
 
 	self:stopEngineIfNotNeeded()
 
+	self:updateTrafficConflictDetector(self.course, self.ppc:getRelevantWaypointIx(), self:getSpeed())
+
+	-- check if reversing
+	local lx, lz, moveForwards, isReverseActive = self:getReverseDrivingDirection()
+
 	if isReverseActive then
 		-- we go wherever goReverse() told us to go
 		self:driveVehicleInDirection(dt, self.allowedToDrive, moveForwards, lx, lz, self:getSpeed())
-	elseif self.useDirection then
-		lx, lz = self.ppc:getGoalPointDirection()
-		self:debug('%.1f %.1f', lx, lz)
-		self:driveVehicleInDirection(dt, self.allowedToDrive, moveForwards, lx / 2, lz, self:getSpeed())
 	else
 		-- use the PPC goal point when forward driving or reversing without trailer
 		local gx, _, gz = self.ppc:getGoalPointLocalPosition()
@@ -435,7 +520,7 @@ function AIDriver:driveVehicleToLocalPosition(dt, allowedToDrive, moveForwards, 
 		-- TODO: remove allowedToDrive parameter and only use self.allowedToDrive
 	if not self.allowedToDrive then allowedToDrive = false end
 
-	maxSpeed, allowedToDrive = self:checkProximitySensor(maxSpeed, allowedToDrive, moveForwards)
+	maxSpeed, allowedToDrive, moveForwards = self:checkSafetyConstraints(maxSpeed, allowedToDrive, moveForwards)
 
 	-- driveToPoint does not like speeds under 1.5 (will stop) so make sure we set at least 2
 	if maxSpeed > 0.01 and maxSpeed < 2 then
@@ -449,13 +534,19 @@ function AIDriver:driveVehicleToLocalPosition(dt, allowedToDrive, moveForwards, 
 	AIVehicleUtil.driveToPoint(self.vehicle, dt, self.acceleration, allowedToDrive, moveForwards, ax, az, maxSpeed, false)
 end
 
+--[[ emergency brake, maybe for mode 4/8 refill at trigger ??
+	local oldFunc = self.vehicle.getBrakeForce
+	self.vehicle.getBrakeForce = function () return 10000000 end
+	AIVehicleUtil.driveToPoint(self.vehicle, dt, self.acceleration, allowedToDrive, moveForwards, ax, az, maxSpeed, false)
+	self.vehicle.getBrakeForce = oldFunc
+]]--
+
 -- many courseplay modes control the vehicle through the lx/lz normalized local directions.
 -- this is an interface for those modes to drive the vehicle.
 function AIDriver:driveVehicleInDirection(dt, allowedToDrive, moveForwards, lx, lz, maxSpeed)
 	-- construct an artificial goal point to drive to
 	local gx, gz = lx * self.ppc:getLookaheadDistance(), lz * self.ppc:getLookaheadDistance()
 	self:driveVehicleToLocalPosition(dt, allowedToDrive, moveForwards, gx, gz, maxSpeed)
-
 end
 
 --- Drive vehicle by using a steering angle. This is similar to the Giants AIVehicleUtil.driveInDirection() but
@@ -488,8 +579,8 @@ function AIDriver:driveVehicleBySteeringAngle(dt, moveForwards, steeringAngleNor
 	end
 	if self.vehicle.firstTimeRun then
 		local acc = self.acceleration;
-		
-		maxSpeed, self.allowedToDrive = self:checkProximitySensor(maxSpeed, self.allowedToDrive, moveForwards)
+
+		maxSpeed, self.allowedToDrive, moveForwards = self:checkSafetyConstraints(maxSpeed, self.allowedToDrive, moveForwards)
 
 		if maxSpeed ~= nil and maxSpeed ~= 0 then
 			if steeringAngleNormalized >= self.slowAngleLimit then
@@ -510,6 +601,8 @@ function AIDriver:driveVehicleBySteeringAngle(dt, moveForwards, steeringAngleNor
 		if not moveForwards then
 			acc = -acc;
 		end
+		local node = moveForwards and self:getFrontMarkerNode(self.vehicle) or self:getBackMarkerNode(self.vehicle)
+		self:updateTrafficConflictDetector(nil, nil, maxSpeed, moveForwards, node)
 		WheelsUtil.updateWheelsPhysics(self.vehicle, dt, self.vehicle.lastSpeedReal*self.vehicle.movingDirection, acc, not self.allowedToDrive, true)
 	end
 end
@@ -529,7 +622,6 @@ function AIDriver:startCourse(course, ix, nextCourse, nextWpIx)
 	else
 		self:debug('Starting a course, at waypoint %d, no next course set.', ix)
 	end
-	self:resetTrafficControl()
 	self.nextWpIx = nextWpIx
 	self.nextCourse = nextCourse
 	self.course = course
@@ -578,12 +670,16 @@ function AIDriver:onEndCourse()
 			self.vehicle.spec_autodrive:StartDrivingWithPathFinder(self.vehicle, parkDestination, -3, nil, nil, nil)
 		end
 	elseif self.vehicle.cp.settings.stopAtEnd:is(true) then
-		if self.state ~= self.states.STOPPED then
-			self:stop('END_POINT')
-		end
+		self:onEndCourseFinished()
 	else
 		-- continue at the first waypoint
 		self.ppc:initialize(1)
+	end
+end
+
+function AIDriver:onEndCourseFinished()
+	if self.state ~= self.states.STOPPED then
+		self:stop('END_POINT')
 	end
 end
 
@@ -748,6 +844,11 @@ function AIDriver:getTotalLength()
 	return self.vehicle.cp.totalLength
 end
 
+--- Get waypoint closest to the current position of the vehicle
+function AIDriver:getRelevantWaypointIx()
+	return self.ppc:getRelevantWaypointIx()
+end
+
 function AIDriver:getRecordedSpeed()
 	-- default is the street speed (reduced in corners)
 	local speed = self:getDefaultStreetSpeed(self.ppc:getCurrentWaypointIx()) or self.vehicle.cp.speeds.street
@@ -762,7 +863,7 @@ end
 function AIDriver:getDefaultStreetSpeed(ix)
 	-- reduce speed before the end of the course
 	local dToEnd = self.course:getDistanceToLastWaypoint(ix)
-	if dToEnd < 15 then
+	if dToEnd < self:getSlowDownDistanceBeforeLastWaypoint() then
 		-- TODO make this smoother depending on the remaining distance?
 		return self.vehicle.cp.speeds.turn
 	end
@@ -770,6 +871,12 @@ function AIDriver:getDefaultStreetSpeed(ix)
 	if radius then
 		return math.max(self.vehicle.cp.speeds.turn, math.min(radius / 20 * self.vehicle.cp.speeds.street, self.vehicle.cp.speeds.street))
 	end
+	return self.vehicle.cp.speeds.street
+end
+
+-- if closer than this to the last waypoint, start slowing down
+function AIDriver:getSlowDownDistanceBeforeLastWaypoint()
+	return AIDriver.defaultSlowDownDistanceBeforeLastWaypoint
 end
 
 function AIDriver:slowDownForWaitPoints()
@@ -783,7 +890,7 @@ function AIDriver:isNearFillPoint()
 	if self.course == nil then
 		return false
 	else
-		return self.course:havePhysicallyPassedWaypoint(self:getDirectionNode(),#self.course.waypoints) and self.ppc:getCurrentWaypointIx() <= 3;
+		return self.course:havePhysicallyPassedWaypoint(self:getDirectionNode(),#self.course.waypoints) and self.ppc:getCurrentWaypointIx() <= 5;
 	end
 end
 
@@ -850,12 +957,11 @@ function AIDriver:debugSparse(...)
 end
 
 function AIDriver:isStopped()
-	-- giants supplied last speed is in mm/s
-	return math.abs(self.vehicle.lastSpeedReal) < 0.0001
+	return AIDriverUtil.isStopped(self.vehicle)
 end
 
 function AIDriver:drawTemporaryCourse()
-	if not self.course:isTemporary() then return end
+	if not self.course or not self.course:isTemporary() then return end
 	if self.vehicle.cp.settings.enableVisualWaypointsTemporary:is(false) and
 			not courseplay.debugChannels[self.debugChannel] then
 		return
@@ -870,6 +976,18 @@ function AIDriver:drawTemporaryCourse()
 			cpDebug:drawLine(x, y + 3, z, 0, 0, 100, nx, ny + 3, nz)
 		end
 	end
+end
+
+function AIDriver:enableTrafficConflictDetection()
+	self.trafficConflictDetectionEnabled = true
+end
+
+function AIDriver:disableTrafficConflictDetection()
+	self.trafficConflictDetectionEnabled = false
+end
+
+function AIDriver:isTrafficConflictDetectionEnabled()
+	return self.trafficConflictDetectionEnabled
 end
 
 function AIDriver:enableCollisionDetection()
@@ -1084,6 +1202,7 @@ function AIDriver:checkForHeapBehindMe(tipper)
 	end
 end
 
+--only bga, else triggerHandler handles discharge!
 function AIDriver:dischargeAtTipTrigger(dt)
 	local trigger = self.vehicle.cp.currentTipTrigger
 	local allowedToDrive, takeOverSteering = true
@@ -1097,40 +1216,10 @@ function AIDriver:dischargeAtTipTrigger(dt)
 				--we are reversing into the BGA Silo. We are taking the last rev waypoint as virtual unloadpoint and start tipping there the same way as on unload point
 				allowedToDrive, takeOverSteering = self:dischargeAtUnloadPoint(dt,self.course:getLastReverseAt(self.ppc:getCurrentWaypointIx()))     
 			end
-		else
-			--using all standard tip triggers
-			allowedToDrive = self:tipIntoStandardTipTrigger()
-		end;
-	end
-	return allowedToDrive, takeOverSteering
-end
-
-function AIDriver:tipIntoStandardTipTrigger()
-	local stopForTipping = false
-	local siloIsFull = false
-	for _, tipper in pairs(self.vehicle.cp.workTools) do
-		if tipper.spec_dischargeable ~= nil then
-			if self:tipTriggerIsFull(trigger,tipper) then
-				siloIsFull = true
-				stopForTipping = true
-			else
-				for i=1,#tipper.spec_dischargeable.dischargeNodes do
-					if tipper:getCanDischargeToObject(tipper.spec_dischargeable.dischargeNodes[i])then
-						tipper:setDischargeState(Dischargeable.DISCHARGE_STATE_OBJECT)
-						stopForTipping = true
-					end
-				end
-			end
+			courseplay:setInfoText(self.vehicle, "COURSEPLAY_TIPTRIGGER_REACHED");
 		end
 	end
-	if not self:getHasAllTippersClosed() then
-		stopForTipping = true
-	end
-	if siloIsFull then
-		self:setInfoText('FARM_SILO_IS_FULL')
-	end
-	
-	return not stopForTipping
+	return allowedToDrive, takeOverSteering
 end
 
 function AIDriver:tipIntoBGASiloTipTrigger(dt)
@@ -1204,7 +1293,7 @@ function AIDriver:onUnLoadCourse(allowedToDrive, dt)
 	self:setSpeed(self:getRecordedSpeed())
 	--handle cover
 	if self:hasTipTrigger() or isNearUnloadPoint then
-		courseplay:openCloseCover(self.vehicle, not courseplay.SHOW_COVERS)
+		self:openCovers(self.vehicle)
 	end
 	-- done tipping?
 	if self:hasTipTrigger() and self.vehicle.cp.totalFillLevel == 0 and self:getHasAllTippersClosed() then
@@ -1216,12 +1305,10 @@ function AIDriver:onUnLoadCourse(allowedToDrive, dt)
 
 	-- tipper is not empty and tractor reaches TipTrigger
 	--if self.vehicle.cp.totalFillLevel > 0 then
-		if  self:hasTipTrigger()
-		and not self:isNearFillPoint() then
-			self:setSpeed(self.vehicle.cp.speeds.approach)
-			allowedToDrive, takeOverSteering = self:dischargeAtTipTrigger(dt)
-			courseplay:setInfoText(self.vehicle, "COURSEPLAY_TIPTRIGGER_REACHED");
-		end
+	if self:hasTipTrigger() and not self:isNearFillPoint() then
+		self:setSpeed(self.vehicle.cp.speeds.approach)
+		allowedToDrive, takeOverSteering = self:dischargeAtTipTrigger(dt)
+	end
 	--end
 	-- tractor reaches unloadPoint
 	if isNearUnloadPoint then
@@ -1324,23 +1411,22 @@ function AIDriver:getHasAllTippersClosed()
 end
 
 function AIDriver:setOffsetInBGASilo()
-	if self.BunkerSiloMap == nil then
-		self.BunkerSilo = g_bunkerSiloManager:getTargetBunkerSiloByPointOnCourse(self.course,self.ppc:getCurrentWaypointIx()+3)
-		if self.BunkerSilo ~= nil then
-			self.BunkerSiloMap = g_bunkerSiloManager:createBunkerSiloMap(self.vehicle, self.BunkerSilo,3)
+	if self.bunkerSiloManager == nil then
+		local silo = BunkerSiloManagerUtil.getTargetBunkerSiloByPointOnCourse(self.course,self.ppc:getCurrentWaypointIx()+3)
+		if silo then
+			self.bunkerSiloManager = BunkerSiloManager(self.vehicle, silo,3)
 		end
 	end
-	if self.BunkerSiloMap ~= nil then
+	if self.bunkerSiloManager ~= nil then
 		if self.bestColumnToFill == nil then
-			self.bestColumnToFill = g_bunkerSiloManager:getBestColumnToFill(self.BunkerSiloMap)
-			self.ppc:initialize(g_bunkerSiloManager:setOffsetsPerWayPoint(self.course,self.BunkerSiloMap,self.bestColumnToFill,self.ppc:getCurrentWaypointIx()))
+			self.bestColumnToFill = self.bunkerSiloManager:getBestColumnToFill()
+			self.ppc:initialize(self.bunkerSiloManager:setOffsetsPerWayPoint(self.course,self.bestColumnToFill,self.ppc:getCurrentWaypointIx()))
 		end
 	end
 end
 
 function AIDriver:resetBGASiloTables()
-	self.BunkerSilo = nil
-	self.BunkerSiloMap = nil
+	self.bunkerSiloManager = nil
 	self.offsetsPerWayPoint = nil
 	self.bestColumnToFill = nil
 end
@@ -1364,7 +1450,6 @@ end
 function AIDriver:startCourseWithPathfinding(course, ix, zOffset, fieldNum, alwaysUsePathfinding)
 	-- make sure we have at least a direct course until we figure out a better path. This can happen
 	-- when we don't have a course set yet when starting the pathfinding, for example when starting the course.
-	self:resetTrafficControl()
 	self.course = course
 	self.ppc:setCourse(course)
 	self.ppc:initialize(ix)
@@ -1554,11 +1639,18 @@ function AIDriver:onDraw()
 	if CpManager.isDeveloper and self.pathfinder then
 		PathfinderUtil.showNodes(self.pathfinder)
 	end
-
 end
 --TODO: do we want to continue using this setter/getter for driveUnloadNow??
 function AIDriver:setDriveUnloadNow(driveUnloadNow)
 	courseplay:setDriveUnloadNow(self.vehicle, driveUnloadNow or false)
+end
+
+function AIDriver:setDriveNow()
+	if self:isWaiting() then 
+		self:continue()
+		self.vehicle.cp.wait = false
+	end
+	self.triggerHandler:onDriveNow()
 end
 
 function AIDriver:getDriveUnloadNow()
@@ -1594,13 +1686,68 @@ function AIDriver:onUnBlocked()
 	self:debug('Unblocked...')
 end
 
-function AIDriver:trafficControlOK()
-	-- TODO: why the root node? Why not the vehicle itself?
-	return g_trafficController:reserve(self.vehicle.rootNode, self.course, self.ppc:getCurrentWaypointIx())
+--- Speed we think we'd be driving normally, used by the conflict detection to predict the vehicle's location
+function AIDriver:getNominalSpeed()
+	return self:getRecordedSpeed()
 end
 
-function AIDriver:resetTrafficControl()
-	g_trafficController:cancel(self.vehicle.rootNode)
+function AIDriver:createTrafficConflictDetector()
+	self.trafficConflictDetector = TrafficConflictDetector(self.vehicle, self.course)
+end
+
+function AIDriver:updateTrafficConflictDetector(course, ix, speed, moveForwards, node)
+	if self.trafficConflictDetector then
+		if self:isTrafficConflictDetectionEnabled() then
+			self.trafficConflictDetector:update(course, ix, speed, moveForwards, node or self:getDirectionNode())
+		else
+			self.trafficConflictDetector:update(nil, 0, 0, moveForwards, node or self:getDirectionNode())
+		end
+	end
+end
+
+function AIDriver:onRightOfWayEvaluated(otherVehicle, mustYield, headOn)
+	if self.trafficConflictDetector then
+		self.trafficConflictDetector:onRightOfWayEvaluated(otherVehicle, mustYield, headOn)
+	end
+end
+
+function AIDriver:removeAllConflictsForVehicle(otherVehicle)
+	if self.trafficConflictDetector then
+		self.trafficConflictDetector:removeAllConflictsForVehicle(otherVehicle)
+	end
+end
+
+function AIDriver:slowDownForTraffic(maxSpeed, allowedToDrive)
+	if maxSpeed == 0 or not allowedToDrive then
+		return maxSpeed, allowedToDrive
+	end
+	-- traffic conflict detection completely disabled
+	if not self:isTrafficConflictDetectionEnabled() then
+		return maxSpeed, allowedToDrive
+	end
+	-- traffic conflict detector enabled, so others can see where we are going and resolve conflicts with us,
+	-- but we won't slow down or hold (for example maneuvering chopper/combine uses the proximity sensor)
+	if not self.trafficConflictDetector:isSpeedControlEnabled() then
+		return maxSpeed, allowedToDrive
+	end
+	local closestConflictDistance = self.trafficConflictDetector:getClosestConflictDistance()
+	local closestConflictingVehicle = self.trafficConflictDetector:getClosestConflictingVehicle()
+	if self.trafficConflictDetector:shouldHold() then
+		self:debugSparse('Traffic conflict with %s in %.1f m, hold', nameNum(closestConflictingVehicle), closestConflictDistance)
+		self:clearInfoText('SLOWING_DOWN_FOR_TRAFFIC')
+		self:setInfoText('TRAFFIC')
+		allowedToDrive = false
+	elseif self.trafficConflictDetector:shouldSlowDown() then
+		self:debugSparse('Traffic conflict with %s in %.1f m, half speed', nameNum(closestConflictingVehicle), closestConflictDistance)
+		self:clearInfoText('TRAFFIC')
+		self:setInfoText('SLOWING_DOWN_FOR_TRAFFIC')
+		maxSpeed = maxSpeed / 2
+	else
+		-- no conflict anymore
+		self:clearInfoText('TRAFFIC')
+		self:clearInfoText('SLOWING_DOWN_FOR_TRAFFIC')
+	end
+	return maxSpeed, allowedToDrive
 end
 
 function AIDriver:detectSlipping()
@@ -1627,36 +1774,28 @@ function AIDriver:detectSlipping()
 	end
 end
 
-function AIDriver:initWages()
-	local spec = self.vehicle.spec_aiVehicle
-	if spec.startedFarmId == nil or spec.startedFarmId == 0 then
-		-- to make the wage paying in AIVehicle work it needs to have the correct farm ID
-		spec.startedFarmId = self.vehicle.controllerFarmId
-	end
-end
-
-function AIDriver:payWages(dt)
-	local spec = self.vehicle.spec_aiVehicle
-	local courseplayMultiplier
-	-- The Giants AIVehicle always pays wages so we need to take that into account and compensate for it
-	-- when paying less than 100% (hence the -1)
-	if courseplay.globalSettings.earnWages:is(true) and self:shouldPayWages() then
-		courseplayMultiplier = courseplay.globalSettings.workerWages:get() / 100 - 1
-	else
-		-- compensate for all the Giants wage paying
-		courseplayMultiplier = -1
-	end
-	if spec and g_server ~= nil then
-		local difficultyMultiplier = g_currentMission.missionInfo.buyPriceMultiplier
-		local wage = -dt * difficultyMultiplier * courseplayMultiplier * spec.pricePerMS
-		g_currentMission:addMoney(wage, spec.startedFarmId, MoneyType.AI, true)
-	end
-end
-
 --- By default, do pay wages when enabled. Some derived classes may decide not to pay under circumstances
 function AIDriver:shouldPayWages()
 	return true
 end
+
+function AIDriver:getWagesPercentageAmount()
+	return self:shouldPayWages() and courseplay.globalSettings.workerWages:get() / 100 or 0
+end
+
+--handle a wage multiplier or disable wages completely
+function AIDriver:updateAILowFrequency(superFunc,dt)
+	local rootVehicle = self:getRootVehicle()
+	if courseplay:isAIDriverActive(rootVehicle) then
+		local oldMultiplier = g_currentMission.missionInfo.buyPriceMultiplier
+		g_currentMission.missionInfo.buyPriceMultiplier = g_currentMission.missionInfo.buyPriceMultiplier * rootVehicle.cp.driver:getWagesPercentageAmount()
+		superFunc(self,dt)
+		g_currentMission.missionInfo.buyPriceMultiplier = oldMultiplier
+	else 
+		superFunc(self,dt)
+	end
+end
+AIVehicle.updateAILowFrequency = Utils.overwrittenFunction(AIVehicle.updateAILowFrequency, AIDriver.updateAILowFrequency)
 
 function AIDriver:getAllowReversePathfinding()
 	return self.allowReversePathfinding and self.vehicle.cp.settings.allowReverseForPathfindingInTurns:is(true)
@@ -1686,8 +1825,11 @@ function AIDriver:setBackMarkerNode(vehicle)
 	if AIDriverUtil.hasImplementsOnTheBack(vehicle) then
 		local lastImplement
 		lastImplement, backMarkerOffset = AIDriverUtil.getLastAttachedImplement(vehicle)
-		referenceNode = lastImplement.rootNode
-		self:debug('Using the last implement\'s root node for the rear proximity sensor, %d m from root node', backMarkerOffset)
+		referenceNode = vehicle.rootNode
+		self:debug('Using the last implement\'s rear distance for the rear proximity sensor, %d m from root node', backMarkerOffset) 	elseif self.measuredBackDistance then
+		referenceNode = vehicle.rootNode
+		backMarkerOffset = -self.measuredBackDistance
+		self:debug('back marker node on measured back distance %.1f', self.measuredBackDistance)
 	elseif reverserNode then
 		-- if there is a reverser node, use that, mainly because that most likely will turn with an implement
 		-- or with the back component of an articulated vehicle. Just need to find out the distance correctly
@@ -1699,9 +1841,13 @@ function AIDriver:setBackMarkerNode(vehicle)
 				debugText, backMarkerOffset, dBetweenRootAndReverserNode)
 	else
 		referenceNode = vehicle.rootNode
-		backMarkerOffset = - vehicle.sizeLength / 2 - vehicle.lengthOffset
+		backMarkerOffset = - vehicle.sizeLength / 2 + vehicle.lengthOffset
 		self:debug('Using the vehicle\'s root node for the rear proximity sensor, %d m from root node', backMarkerOffset)
 	end
+	self:placeBackMarkerNode(vehicle, referenceNode, backMarkerOffset)
+end
+
+function AIDriver:placeBackMarkerNode(vehicle, referenceNode, backMarkerOffset)
 	if not vehicle.cp.driver.aiDriverData.backMarkerNode then
 		vehicle.cp.driver.aiDriverData.backMarkerNode = courseplay.createNode('backMarkerNode', 0, 0, 0, referenceNode)
 	else
@@ -1717,7 +1863,6 @@ function AIDriver:getBackMarkerNode(vehicle)
 end
 
 -- Put a node on the front of the vehicle for easy distance checks use this instead of the root/direction node
--- TODO: check for implements at front like weights
 function AIDriver:setFrontMarkerNode(vehicle)
 	local firstImplement, frontMarkerOffset = AIDriverUtil.getFirstAttachedImplement(vehicle)
 	self:debug('Using the %s\'s root node for the front proximity sensor, %d m from root node',
@@ -1727,9 +1872,15 @@ function AIDriver:setFrontMarkerNode(vehicle)
 		vehicle.cp.driver.aiDriverData.frontMarkerNode = courseplay.createNode('frontMarkerNode', 0, 0, 0, vehicle.rootNode)
 	else
 		unlink(vehicle.cp.driver.aiDriverData.frontMarkerNode)
-		link(firstImplement.rootNode, vehicle.cp.driver.aiDriverData.frontMarkerNode)
+		link(vehicle.rootNode, vehicle.cp.driver.aiDriverData.frontMarkerNode)
 	end
 	setTranslation(vehicle.cp.driver.aiDriverData.frontMarkerNode, 0, 0, frontMarkerOffset)
+	-- Make sure the front marker node does not point up or down, for example in case of
+	-- a pallet fork can be moved up/down, we don't want the node pointing up/down, we want it
+	-- pointing forward, having the same x rotation as the vehicle itself
+	local wrx, _, _ = getWorldRotation(vehicle.rootNode)
+	local _, ry, rz = getWorldRotation(vehicle.cp.driver.aiDriverData.frontMarkerNode)
+	setWorldRotation(vehicle.cp.driver.aiDriverData.frontMarkerNode, wrx, ry, rz)
 end
 
 function AIDriver:getFrontMarkerNode(vehicle)
@@ -1738,54 +1889,294 @@ end
 
 function AIDriver:addForwardProximitySensor()
 	self:setFrontMarkerNode(self.vehicle)
-	self.forwardLookingProximitySensorPack = ForwardLookingProximitySensorPack(self:getFrontMarkerNode(self.vehicle), self.proximitySensorRange, 1)
+	self.forwardLookingProximitySensorPack = ForwardLookingProximitySensorPack(
+			self.vehicle, self.ppc, self:getFrontMarkerNode(self.vehicle), self.proximitySensorRange, 1)
 end
 
 function AIDriver:addBackwardProximitySensor()
 	self:setBackMarkerNode(self.vehicle)
-	self.backwardLookingProximitySensorPack = BackwardLookingProximitySensorPack(self:getBackMarkerNode(self.vehicle), self.proximitySensorRange, 1)
+	self.backwardLookingProximitySensorPack = BackwardLookingProximitySensorPack(
+			self.vehicle, self.ppc, self:getBackMarkerNode(self.vehicle), self.proximitySensorRange, 1)
 end
 
-function AIDriver:updateProximitySensors()
+function AIDriver:checkSafetyConstraints(maxSpeed, allowedToDrive, moveForwards)
+	local proximityLimitedSpeed, trafficLimitedSpeed
+	proximityLimitedSpeed, allowedToDrive, moveForwards = self:checkProximitySensor(maxSpeed, allowedToDrive, moveForwards)
+	trafficLimitedSpeed, allowedToDrive = self:slowDownForTraffic(maxSpeed, allowedToDrive)
+	return math.min(proximityLimitedSpeed, trafficLimitedSpeed), allowedToDrive, moveForwards
+end
+
+------------------------------------------------------------------------------------------------------------------------
+--- Proximity sensor control
+------------------------------------------------------------------------------------------------------------------------
+--- proximity speed control enabled/disabled: if disabled, all of the vehicle's proximity sensors are deactivated and
+--- won't see anything, therefore, no stopping/slowing down/swerving on obstacles
+function AIDriver:enableProximitySpeedControl()
+	self.proximitySpeedControlEnabled = true
+end
+
+function AIDriver:disableProximitySpeedControl()
+	self.proximitySpeedControlEnabled = false
+end
+
+function AIDriver:isProximitySpeedControlEnabled()
+	return self.proximitySpeedControlEnabled
+end
+
+--- proximity swerve enabled/disabled: will try to swerve for other vehicles when enabled. Will swerve for CP driven
+--- vehicles only when driving in a different direction (heading difference > 45 degrees)
+function AIDriver:enableProximitySwerve()
+	self.proximitySwerveEnabled = true
+end
+
+function AIDriver:disableProximitySwerve()
+	self.proximitySwerveEnabled = false
+end
+
+--- proximity swerve enabled is checked with isProximitySwerveEnabled() and thus can be extended in derived classes with
+--- checking for the specific vehicle.
+function AIDriver:isProximitySwerveEnabled(vehicle)
+	return self.proximitySwerveEnabled
+end
+
+
+--- proximity slow down: slowing down when close to another vehicle
+--- proximity slow down is checked with isProximitySlowDownEnabled() and thus can be extended in derived classes with
+--- checking for the specific vehicle.
+function AIDriver:isProximitySlowDownEnabled(vehicle)
+	return true
+end
+
+--- Temporarily ignore vehicle for the forward proximity sensor
+function AIDriver:ignoreVehicleProximity(vehicleToIgnore, ttlMs)
 	if self.forwardLookingProximitySensorPack then
-		self.forwardLookingProximitySensorPack:update()
-	end
-	if self.backwardLookingProximitySensorPack then
-		self.backwardLookingProximitySensorPack:update()
+		self.forwardLookingProximitySensorPack:setIgnoredVehicle(vehicleToIgnore, ttlMs or 2000)
 	end
 end
+
+function AIDriver:haveHeadOnConflictWith(vehicle)
+	if vehicle and self.trafficConflictDetector and
+			self:isTrafficConflictDetectionEnabled() and
+			self.trafficConflictDetector:isSpeedControlEnabled() and
+			self.trafficConflictDetector:haveHeadOnConflictWith(vehicle) then
+		return true
+	else
+		return false
+	end
+end
+
+function AIDriver:haveConflictWith(vehicle)
+	return vehicle and self.trafficConflictDetector and
+			self.trafficConflictDetector:haveConflictWith(vehicle)
+end
+
+AIDriver.psStateNotMoving = {name = 'not moving'}
+AIDriver.psStateNoObstacle = {name = 'no obstacle'}
+AIDriver.psStateNoVehicle = {name = 'no vehicle'}
+AIDriver.psStateReverse = {name = 'reverse'}
+AIDriver.psStateSwerve = {name = 'swerve'}
+AIDriver.psStateSlowDown = {name = 'slow down'}
+AIDriver.psStateSlowDownDisabled = {name = 'slow down disabled'}
+AIDriver.psStateReverse = {name = 'reverse'}
+AIDriver.psStateStop = {name = 'stop'}
 
 function AIDriver:checkProximitySensor(maxSpeed, allowedToDrive, moveForwards)
+
+	local function debug(state, ...)
+		if state ~= self.lastProximitySensorState then
+			self.lastProximitySensorState = state
+			self:debug(string.format('psState %s: %s', state.name, string.format(...)))
+		end
+	end
+
 	if maxSpeed == 0 or not allowedToDrive then
+		--self.course:setTargetTemporaryOffsetX(0)
 		-- we are not going anywhere anyway, no use of proximity sensor here
-		return maxSpeed, allowedToDrive
+		debug(AIDriver.psStateNotMoving, '')
+		return maxSpeed, allowedToDrive, moveForwards
 	end
-	-- minimum distance from any object in the proximity sensor's range
-	local d, range = math.huge, 10
-	if moveForwards then
-		if self.forwardLookingProximitySensorPack and self.forwardLookingProximitySensorPack:isSpeedControlEnabled() then
-			d = self.forwardLookingProximitySensorPack:getClosestObjectDistanceAndRootVehicle()
-			range = self.forwardLookingProximitySensorPack:getRange()
-		end
-	else
-		if self.backwardLookingProximitySensorPack and self.backwardLookingProximitySensorPack:isSpeedControlEnabled() then
-			d = self.backwardLookingProximitySensorPack:getClosestObjectDistanceAndRootVehicle()
-			range = self.backwardLookingProximitySensorPack:getRange()
-		end
+
+	-- d is minimum distance from any object in the proximity sensor's range
+	local d, vehicle, range, deg, dAvg = math.huge, nil, 10, 0
+	local pack = moveForwards and self.forwardLookingProximitySensorPack or self.backwardLookingProximitySensorPack
+	if pack and self:isProximitySpeedControlEnabled() then
+		d, vehicle, deg, dAvg = pack:getClosestObjectDistanceAndRootVehicle()
+		range = pack:getRange()
 	end
-	if d < AIDriver.proximityLimitLow then
-		-- too close, stop
-		self:debugSparse('proximity: d = %.1f, too close, stop.', d)
-		return maxSpeed, false
+
+	-- we only slow down or swerve for other vehicles, if the proximity sensor hits something else, ignore (for now at least)
+	if not vehicle then
+		self:clearInfoText('SLOWING_DOWN_FOR_TRAFFIC')
+		self:clearInfoText('TRAFFIC')
+		self.course:setTemporaryOffset(0, 0, 4000)
+		debug(AIDriver.psStateNoVehicle, '')
+		return maxSpeed, allowedToDrive, moveForwards
 	end
+
 	local normalizedD = d / (range - AIDriver.proximityLimitLow)
-	if normalizedD > 1 then
-		-- nothing in range (d is a huge number, at least bigger than range), don't change anything
-		return maxSpeed, allowedToDrive
+
+	local obstacleAhead = math.abs(deg) < AIDriver.proximityAngleAheadDeg
+
+	if d < AIDriver.proximityLimitReverse and obstacleAhead then
+		-- too close, reverse
+		self:clearInfoText('SLOWING_DOWN_FOR_TRAFFIC')
+		self:setInfoText('TRAFFIC')
+		self:setSpeed(self.vehicle.cp.speeds.reverse)
+		debug(AIDriver.psStateReverse, 'd = %.1f, deg = %.1f, way too close, reversing.', d, deg)
+		return maxSpeed, allowedToDrive, false
 	end
-	-- something in range, reduce speed proportionally
+
+	if d < AIDriver.proximityLimitLow and obstacleAhead then
+		-- too close, stop
+		self:clearInfoText('SLOWING_DOWN_FOR_TRAFFIC')
+		self:setInfoText('TRAFFIC')
+		debug(AIDriver.psStateStop, 'd = %.1f, deg = %.1f, too close, stop.', d, deg)
+		return maxSpeed, false, moveForwards
+	end
+
+	if normalizedD > 1 then
+		self:clearInfoText('SLOWING_DOWN_FOR_TRAFFIC')
+		self:clearInfoText('TRAFFIC')
+		self.course:setTemporaryOffset(0, 0, 4000)
+		-- nothing in range (d is a huge number, at least bigger than range), don't change anything
+		debug(AIDriver.psStateNoObstacle, '')
+		return maxSpeed, allowedToDrive, moveForwards
+	end
+
+	-- something in range, reduce speed proportionally when enabled
 	local deltaV = maxSpeed - AIDriver.proximityMinLimitedSpeed
-	local newSpeed = AIDriver.proximityMinLimitedSpeed + normalizedD * deltaV
-	self:debugSparse('proximity: d = %.1f (%d %%), speed = %.1f', d, 100 * normalizedD, newSpeed)
-	return newSpeed, allowedToDrive
+	local slowSpeed = AIDriver.proximityMinLimitedSpeed + normalizedD * deltaV
+	local newSpeed = maxSpeed
+	local sameDirection = TurnContext.isSameDirection(
+			AIDriverUtil.getDirectionNode(self.vehicle), AIDriverUtil.getDirectionNode(vehicle), 45)
+	-- check for nil and NaN
+	if deg and deg == deg and self:isProximitySwerveEnabled(vehicle) and
+			(not sameDirection or not vehicle:getIsCourseplayDriving()) then
+		local dx = dAvg * math.sin(math.rad(deg))
+		-- which direction to swerve (have a little bias for right, sorry UK folks :)
+		local dir = dx > -1.2 and 1 or -1
+		self:setInfoText('SLOWING_DOWN_FOR_TRAFFIC')
+		self.ppc:setTemporaryShortLookaheadDistance(1000)
+		-- we should be at least 4 m from the other vehicle
+		local setPoint = dir * 4
+		local error = setPoint - dx
+		local offsetChange = 0.5 * error
+		self.course:changeTemporaryOffsetX(offsetChange, 1000)
+		-- always slow down when swerving
+		newSpeed = slowSpeed
+		debug(AIDriver.psStateSwerve, 'dAvg = %.1f (%d), speed = %.1f, swerve dx = %.1f, setPoint = %.1f, error = %.1f, offsetChange = %.1f',
+				dAvg, 100 * normalizedD, newSpeed, dx, setPoint, error, offsetChange)
+	else
+		if self:isProximitySlowDownEnabled(vehicle) then
+			newSpeed = slowSpeed
+			self:setInfoText('SLOWING_DOWN_FOR_TRAFFIC')
+			debug(AIDriver.psStateSlowDown, 'proximity: d = %.1f (%d), speed = %.1f, deg = %.1f',
+					d, 100 * normalizedD, newSpeed, deg)
+		else
+			newSpeed = maxSpeed
+			debug(AIDriver.psStateSlowDownDisabled, 'proximity: d = %.1f (%d), speed = %.1f, deg = %.1f',
+					d, 100 * normalizedD, newSpeed, deg)
+		end
+		-- not swerving, reset offset
+		self.course:setTemporaryOffset(0, 0, 6000)
+	end
+	return newSpeed, allowedToDrive, moveForwards
 end
+
+function AIDriver:isAutoDriveDriving()
+	return false
+end
+
+function AIDriver:isFuelLevelOk()
+	local currentFuelPercentage = self:getFuelLevelPercentage()
+	if currentFuelPercentage < 5 then
+		CpManager:setGlobalInfoText(self.vehicle, 'FUEL_MUST');
+		return false
+	elseif currentFuelPercentage < 20 then
+		CpManager:setGlobalInfoText(self.vehicle, 'FUEL_SHOULD');
+	elseif currentFuelPercentage < 99.99 then
+	--	CpManager:setGlobalInfoText(vehicle, 'FUEL_IS');
+	end;
+	return true
+end
+
+function AIDriver:isValidFuelType(object,fillType,fillUnitIndex)
+	if object.getConsumerFillUnitIndex then 
+		local index = object:getConsumerFillUnitIndex(fillType)
+		if fillUnitIndex ~= nil then 
+			return fillUnitIndex and fillUnitIndex == index
+		end		
+		return index 
+	end
+end
+
+function AIDriver:getFuelLevelPercentage()
+	if self.vehicle.getConsumerFillUnitIndex ~= nil then
+		local dieselIndex = self.vehicle:getConsumerFillUnitIndex(FillType.DIESEL)
+		local electricIndex = self.vehicle:getConsumerFillUnitIndex(FillType.ELECTRICCHARGE)
+		local fuelIndex = dieselIndex or electricIndex
+		if fuelIndex ~= nil then 
+			return self.vehicle:getFillUnitFillLevelPercentage(fuelIndex) * 100;
+		end
+	end
+	return 100
+end
+
+function AIDriver:getSiloSelectedFillTypeSetting()
+
+end
+
+function AIDriver:getSeperateFillTypeLoadingSetting()
+
+end
+
+function AIDriver:notAllowedToLoadNextFillType()
+
+end
+
+function AIDriver:getCanShowDriveOnButton()
+	return self.triggerHandler:isLoading() or self.triggerHandler:isUnloading() or self:isWaiting()
+end
+
+--if validFillType ~= nil, then only open the first valid fillUnit for this fillType,
+--else open all possible covers
+function AIDriver:openCovers(object,validFillType)	
+	if object.spec_cover then
+		if not validFillType then
+			if object.getFillUnits then
+				for fillUnitIndex, fillUnit in pairs(object:getFillUnits()) do
+					SpecializationUtil.raiseEvent(object, "onAddedFillUnitTrigger",nil,fillUnitIndex,1)
+				end
+			end
+		else
+			local validFillUnitIndex = object:getFirstValidFillUnitToFill(validFillType)
+			SpecializationUtil.raiseEvent(object, "onAddedFillUnitTrigger",validFillType,validFillUnitIndex,1)
+		end
+	end
+	for _,impl in pairs(object:getAttachedImplements()) do
+		self:openCovers(impl.object,validFillType)
+	end
+end
+
+--close all covers
+function AIDriver:closeCovers(object)
+	if self.vehicle.cp.settings.automaticCoverHandling:is(false) then
+		return
+	end
+	if object.spec_cover then
+		SpecializationUtil.raiseEvent(object, "onRemovedFillUnitTrigger",0)
+	end
+	for _,impl in pairs(object:getAttachedImplements()) do
+		self:closeCovers(impl.object)
+	end
+end
+
+--disable detaching, while CP is driving
+function AIDriver:isDetachAllowed(superFunc,preSuperFunc)
+	local rootVehicle = self:getRootVehicle()
+	if courseplay:isAIDriverActive(rootVehicle) then
+		return false
+	end	
+	return superFunc(self,preSuperFunc)
+end
+AttacherJoints.isDetachAllowed = Utils.overwrittenFunction(AttacherJoints.isDetachAllowed, AIDriver.isDetachAllowed)

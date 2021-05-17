@@ -121,7 +121,7 @@ function AITurn.canMakeKTurn(vehicle, turnContext)
 		courseplay.debugVehicle(AITurn.debugChannel, vehicle, 'Not all attached implements allow for reversing, use generated course turn')
 		return false
 	end
-	if vehicle.cp.turnOnField and not AITurn.canTurnOnField(turnContext, vehicle) then
+	if vehicle.cp.settings.turnOnField:is(true) and not AITurn.canTurnOnField(turnContext, vehicle) then
 		courseplay.debugVehicle(AITurn.debugChannel, vehicle, 'Turn on field is on but there is not enough space, use generated course turn')
 		return false
 	end
@@ -450,7 +450,11 @@ end
 -- this turn starts when the vehicle reached the point where the implements are raised.
 -- now use turn.lua to generate the turn maneuver waypoints
 function CourseTurn:startTurn()
-	if self.turnContext:isPathfinderTurn(self.turningRadius * 2) then
+	local canTurnOnField = AITurn.canTurnOnField(self.turnContext, self.vehicle)
+	if (canTurnOnField or self.vehicle.cp.settings.turnOnField:is(false)) and
+			self.turnContext:isPathfinderTurn(self.turningRadius * 2) then
+		-- if we can turn on the field or it does not matter if we can, pathfinder turn is ok. If turn on field is on
+		-- but we don't have enough space and have to reverse, fall back to the generated turns
 		self:generatePathfinderTurn()
 	else
 		self:generateCalculatedTurn()
@@ -534,7 +538,7 @@ end
 
 function CourseTurn:generateCalculatedTurn()
 	-- TODO: fix ugly dependency on global variables, there should be one function to create the turn maneuver
-	self.vehicle.cp.turnStage = 1
+	self.vehicle.cp.settings.turnStage:set(true)
 	-- call turn() with stage 1 which will generate the turn waypoints (dt isn't used by that part)
 	courseplay:turn(self.vehicle, 1, self.turnContext)
 	-- they waypoints should now be in turnTargets, create a course based on that
@@ -547,20 +551,14 @@ end
 function CourseTurn:generatePathfinderTurn()
 	self.pathfindingStartedAt = self.vehicle.timer
 	local done, path
-	local turnEndNode, startOffset, goalOffset = self.turnContext:getTurnEndNodeAndOffsets()
-	local canTurnOnField, distanceToReverse = AITurn.canTurnOnField(self.turnContext, self.vehicle)
-	if not canTurnOnField and self.vehicle.cp.turnOnField then
-		self:debug('Turn on field is on, generating reverse course before turning.')
-		self.reverseBeforeStartingTurnWaypoints = self.turnContext:createReverseWaypointsBeforeStartingTurn(self.vehicle, distanceToReverse)
-		startOffset = startOffset - distanceToReverse
-	end
+	local turnEndNode, startOffset, goalOffset = self.turnContext:getTurnEndNodeAndOffsets(self.vehicle)
 
 	if self.vehicle.cp.settings.usePathfindingInTurns:is(false) or self.turnContext:isSimpleWideTurn(self.turningRadius * 2) then
-		self:debug('Wide turn: generate turn with Dubins path')
+		self:debug('Wide turn: generate turn with Dubins path, start offset %.1f, goal offset %.1f', startOffset, goalOffset)
 		path = PathfinderUtil.findDubinsPath(self.vehicle, startOffset, turnEndNode, 0, goalOffset, self.turningRadius)
 		return self:onPathfindingDone(path)
 	else
-		self:debug('Wide turn: generate turn with hybrid A*')
+		self:debug('Wide turn: generate turn with hybrid A*, start offset %.1f, goal offset %.1f', startOffset, goalOffset)
 		self.driver.pathfinder, done, path = PathfinderUtil.findPathForTurn(self.vehicle, startOffset, turnEndNode, goalOffset,
 				self.turningRadius, self.driver:getAllowReversePathfinding(), self.fieldworkCourse)
 		if done then
@@ -650,4 +648,25 @@ function CombinePocketHeadlandTurn:turn(dt)
 		self.driver:lowerImplements()
 		self.implementsLowered = true
 	end
+end
+
+--- A turn type which isn't really a turn, we only use this to finish a row (drive straight until the implement
+--- reaches the end of the row, don't drive towards the next waypoint until then)
+--- This is to make sure the last row before transitioning to the headland is properly finished, otherwise
+--- we'd start driving towards the next headland waypoint, turning towards it before the implement reaching the
+--- end of the row and leaving unworked patches.
+---@class FinishRowOnly : AITurn
+FinishRowOnly = CpObject(AITurn)
+
+function FinishRowOnly:init(vehicle, driver, turnContext)
+	AITurn.init(self, vehicle, driver, turnContext, 'FinishRowOnly')
+end
+
+function FinishRowOnly:finishRow()
+	-- keep driving straight until we need to raise our implements
+	if self.driver:shouldRaiseImplements(self:getRaiseImplementNode()) then
+		self:debug('Row finished, returning to fieldwork.')
+		self.driver:resumeFieldworkAfterTurn(self.turnContext.turnEndWpIx, true)
+	end
+	return false
 end

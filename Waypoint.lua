@@ -257,6 +257,7 @@ function Course:init(vehicle, waypoints, temporary, first, last)
 	end
 	-- offset to apply to every position
 	self.offsetX, self.offsetZ = 0, 0
+	self.temporaryOffsetX, self.temporaryOffsetZ = CpSlowChangingObject(0, 0), CpSlowChangingObject(0, 0)
 	self.numberOfHeadlands = 0
 	self.workWidth = 0
 	-- only for logging purposes
@@ -307,7 +308,17 @@ function Course:getOffset()
 	return self.offsetX, self.offsetZ
 end
 
-	function Course:setWorkWidth(w)
+--- Temporary offset to apply. This is to use an offset temporarily without overwriting the normal offset of the course
+function Course:setTemporaryOffset(x, z, t)
+	self.temporaryOffsetX:set(x, t)
+	self.temporaryOffsetZ:set(z, t)
+end
+
+function Course:changeTemporaryOffsetX(dx, t)
+	self.temporaryOffsetX:set(self.temporaryOffsetX:get() + dx, t)
+end
+
+function Course:setWorkWidth(w)
 	self.workWidth = w
 end
 
@@ -359,6 +370,11 @@ function Course:enrichWaypointData()
 			self.firstCenterWpIx = self.firstCenterWpIx or i	
 		end
 		if self:isTurnStartAtIx(i) then self.totalTurns = self.totalTurns + 1 end
+		if self:isTurnEndAtIx(i) then
+			self.dFromLastTurn = 0
+		elseif self.dFromLastTurn then
+			self.dFromLastTurn = self.dFromLastTurn + dToNext
+		end
 		self.waypoints[i].dToNext = dToNext
 		self.waypoints[i].dToHere = self.length
 		self.waypoints[i].turnsToHere = self.totalTurns
@@ -392,17 +408,19 @@ function Course:enrichWaypointData()
 	self.waypoints[#self.waypoints].turnsToHere = self.totalTurns
 	self.waypoints[#self.waypoints].calculatedRadius = self:calculateRadius(#self.waypoints)
 	self.waypoints[#self.waypoints].reverseOffset = self:isReverseAt(#self.waypoints)
-	-- now add distance to next turn for the combines
-	local dToNextTurn, lNextRow = 0, 0
+	-- now add some metadata for the combines
+	local dToNextTurn, lNextRow, nextRowStartIx = 0, 0, 0
 	local turnFound = false
 	for i = #self.waypoints - 1, 1, -1 do
 		if turnFound then
 			dToNextTurn = dToNextTurn + self.waypoints[i].dToNext
 			self.waypoints[i].dToNextTurn = dToNextTurn
 			self.waypoints[i].lNextRow = lNextRow
+			self.waypoints[i].nextRowStartIx = nextRowStartIx
 		end
 		if self:isTurnStartAtIx(i) then
 			lNextRow = dToNextTurn
+			nextRowStartIx = i + 1
 			dToNextTurn = 0
 			turnFound = true
 		end
@@ -562,13 +580,14 @@ function Course:getWaypointPosition(ix)
 		-- when calculating the offset for a turn start wp.
 		return self:getOffsetPositionWithOtherWaypointDirection(ix, ix - 1)
 	else
-		return self.waypoints[ix]:getOffsetPosition(self.offsetX, self.offsetZ)
+		return self.waypoints[ix]:getOffsetPosition(self.offsetX + self.temporaryOffsetX:get(), self.offsetZ + self.temporaryOffsetZ:get())
 	end
 end
 
 ---Return the offset coordinates of waypoint ix as if it was pointing to the same direction as waypoint ixDir
 function Course:getOffsetPositionWithOtherWaypointDirection(ix, ixDir)
-	return self.waypoints[ix]:getOffsetPosition(self.offsetX, self.offsetZ, self.waypoints[ixDir].dx, self.waypoints[ixDir].dz)
+	return self.waypoints[ix]:getOffsetPosition(self.offsetX + self.temporaryOffsetX:get(), self.offsetZ + self.temporaryOffsetZ:get(),
+			self.waypoints[ixDir].dx, self.waypoints[ixDir].dz)
 end
 
 -- distance between (px,pz) and the ix waypoint
@@ -844,6 +863,7 @@ end
 
 --- Get the index of the first waypoint from ix which is at least distance meters away
 ---@param backward boolean search backward if true
+---@return number, number index and exact distance
 function Course:getNextWaypointIxWithinDistance(ix, distance, backward)
 	local d = 0
 	local from, to, step = ix, #self.waypoints - 1, 1
@@ -852,10 +872,10 @@ function Course:getNextWaypointIxWithinDistance(ix, distance, backward)
 	end
 	for i = from, to, step do
 		d = d + self.waypoints[i].dToNext
-		if d > distance then return i end
+		if d > distance then return i + 1, d end
 	end
 	-- at the end/start of course return last/first wp
-	return to
+	return to + 1, d
 end
 
 --- Get the index of the first waypoint from ix which is at least distance meters away (search backwards)
@@ -866,6 +886,66 @@ function Course:getPreviousWaypointIxWithinDistance(ix, distance)
 		if d > distance then return i end
 	end
 	return nil
+end
+
+--- Collect a nSteps number of positions on the course, starting at startIx, one position for every second,
+--- or every dStep meters, whichever is less
+---@param startIx number start at this waypoint
+---@param dStep number step in meters
+---@param nSteps number number of positions to collect
+function Course:getPositionsOnCourse(nominalSpeed, startIx, dStep, nSteps)
+
+	local function addPosition(positions, ix, x, y, z, dFromLastWp, speed)
+		table.insert(positions, {x = x + dFromLastWp * self.waypoints[ix].dx,
+								 y = y,
+								 z = z + dFromLastWp * self.waypoints[ix].dz,
+								 yRot = self.waypoints[ix].yRot,
+								 speed = speed,
+								 -- for debugging only
+								 dToNext = self.waypoints[ix].dToNext,
+								 dFromLastWp = dFromLastWp,
+								 ix = ix})
+	end
+
+	local positions = {}
+	local d = 0 -- distance from the last step
+	local dFromLastWp = 0
+	local ix = startIx
+	while #positions < nSteps and ix < #self.waypoints do
+		local speed = nominalSpeed
+		if self.waypoints[ix].speed then
+			speed = (self.waypoints[ix].speed > 0) and self.waypoints[ix].speed or nominalSpeed
+		end
+		-- speed / 3.6 is the speed in meter/sec, that's how many meters we travel in one sec
+		-- don't step more than 4 m as that would move the boxes too far away from each other creating a gap between them
+		-- so if we drive fast, our event horizon shrinks, which is probably not a good thing
+		local currentStep = math.min(speed / 3.6, dStep)
+		local x, y, z = self:getWaypointPosition(ix)
+		if dFromLastWp + currentStep < self.waypoints[ix].dToNext then
+			while dFromLastWp + currentStep < self.waypoints[ix].dToNext and #positions < nSteps and ix < #self.waypoints do
+				d = d + currentStep
+				dFromLastWp = dFromLastWp + currentStep
+				addPosition(positions, ix, x, y, z, dFromLastWp, speed)
+			end
+			-- this is before wp ix, so negative
+			dFromLastWp = - (self.waypoints[ix].dToNext - dFromLastWp)
+			d = 0
+            ix = ix + 1
+		else
+            d = - dFromLastWp
+			-- would step over the waypoint
+			while d < currentStep and ix < #self.waypoints do
+				d = d + self.waypoints[ix].dToNext
+				ix = ix + 1
+			end
+			-- this is before wp ix, so negative
+			dFromLastWp = - (d - currentStep)
+			d = 0
+            x, y, z = self:getWaypointPosition(ix)
+			addPosition(positions, ix, x, y, z, dFromLastWp, speed)
+		end
+	end
+	return positions
 end
 
 function Course:getLength()
@@ -1018,6 +1098,49 @@ function Course:getDistanceToNextTurn(ix)
 	return self.waypoints[ix].dToNextTurn
 end
 
+function Course:getDistanceFromLastTurn(ix)
+	return self.waypoints[ix].dFromLastTurn
+end
+
+--- Are we closer than distance to the next turn?
+---@param distance number
+---@return boolean true when we are closer than distance to the next turn, false otherwise, even
+--- if we can't determine the distance to the next turn.
+function Course:isCloseToNextTurn(distance)
+	local ix = self.currentWaypoint
+	if ix then
+		local dToNextTurn = self:getDistanceToNextTurn(ix)
+		if dToNextTurn and dToNextTurn < distance then
+			return true
+		elseif self:isTurnEndAtIx(ix) or self:isTurnStartAtIx(ix) then
+			return true
+		else
+			return false
+		end
+	end
+	return false
+end
+
+--- Are we closer than distance to the next turn?
+---@param distance number
+---@return boolean true when we are closer than distance to the next turn, false otherwise, even
+--- if we can't determine the distance to the next turn.
+function Course:isCloseToLastTurn(distance)
+	local ix = self.currentWaypoint
+	if ix then
+		local dFromLastTurn = self:getDistanceFromLastTurn(ix)
+		if dFromLastTurn and dFromLastTurn < distance then
+			return true
+		else
+			return false
+		end
+	end
+	return false
+end
+
+--- Get the length of the up/down row where waypoint ix is located
+--- @param ix number waypoint index in the row
+--- @return number, number length of the current row and the index of the first waypoint of the row
 function Course:getRowLength(ix)
 	for i = ix, 1, -1 do
 		if self:isTurnEndAtIx(i) then
@@ -1029,6 +1152,10 @@ end
 
 function Course:getNextRowLength(ix)
 	return self.waypoints[ix].lNextRow
+end
+
+function Course:getNextRowStartIx(ix)
+	return self.waypoints[ix].nextRowStartIx
 end
 
 function Course:draw()
@@ -1145,7 +1272,7 @@ function Course:getNextSectionWithProperty(startIx, hasProperty)
 		else
 			-- wp hasn't this property, stop here
 			section:enrichWaypointData()
-			return section, i + 1
+			return section, i
 		end
 	end
 	section:enrichWaypointData()
@@ -1238,6 +1365,10 @@ function Course:calculateOffsetCourse(nVehicles, position, width, useSameTurnWid
 				else
 					offsetHeadlands:calculateData()
 					self:markAsHeadland(offsetHeadlands)
+					if origHeadlandsCourse:isTurnStartAtIx(origHeadlandsCourse:getNumberOfWaypoints()) then
+						courseplay.debugFormat(7, 'Original headland transitioned to the center with a turn, adding a turn start to the offset one')
+						offsetHeadlands[#offsetHeadlands].turnStart = true
+					end
 					addTurnsToCorners(offsetHeadlands, math.rad(60), true)
 					courseGenerator.pointsToXzInPlace(offsetHeadlands)
 					offsetCourse:appendWaypoints(offsetHeadlands)
@@ -1250,7 +1381,7 @@ function Course:calculateOffsetCourse(nVehicles, position, width, useSameTurnWid
 			end
 		else
 			local upDownCourse
-			courseplay.debugFormat(7, 'Get next none-headland %d', ix)
+			courseplay.debugFormat(7, 'Get next non-headland %d', ix)
 			upDownCourse, ix = self:getNextNonHeadlandSection(ix)
 			if upDownCourse:getNumberOfWaypoints() > 0 then
 				courseplay.debugFormat(7, 'Up/down section to %d', ix)
@@ -1348,8 +1479,9 @@ function Course:setPipeInFruitMap(pipeOffsetX, workWidth)
 			pipeInFruitMapHelperWpNode:setToWaypoint(self, row.startIx)
 			-- pipe's local position in the row start wp's system
 			local lx, _, lz = worldToLocal(pipeInFruitMapHelperWpNode.node, x, y, z)
-			-- add 10 cm buffer to make sure turn end/start waypoints have correct data
-			if math.abs(lx) <= halfWorkWidth and lz >= 0.1 and lz <= row.length + 0.1 then
+			-- add 20 m buffer to account for non-perpendicular headlands where technically the pipe
+			-- would not be in the fruit around the end of the row
+			if math.abs(lx) <= halfWorkWidth and lz >= -20 and lz <= row.length + 20 then
 				-- pipe is in the fruit at ix
 				return true
 			end
@@ -1359,7 +1491,7 @@ function Course:setPipeInFruitMap(pipeOffsetX, workWidth)
 
 	-- The idea here is that we walk backwards on the course, remembering each row and adding them
 	-- to the list of unworked rows. This way, at any waypoint we have a list of rows the vehicle
-	-- wouldn't have finished if it was driving the course the right wa		y (start to end).
+	-- wouldn't have finished if it was driving the course the right way (start to end).
 	-- Now check if the pipe would be in any of these unworked rows
 	local rowsNotDone = {}
 	local totalNonHeadlandWps = 0

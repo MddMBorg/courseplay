@@ -61,3 +61,60 @@ function CpObject(base, init)
 	setmetatable(c, mt)
 	return c
 end
+
+--- Object with a time to live.
+---@class CpTemporaryObject
+CpTemporaryObject = CpObject()
+
+function CpTemporaryObject:init(valueWhenExpired)
+	self.valueWhenExpired = valueWhenExpired
+	self.value = self.valueWhenExpired
+	self.expiryTime = g_time
+end
+
+--- Set temporary value for object
+---@value anything the temporary value
+---@ttlMs Time To Live, for ttlMs milliseconds, CpTemporaryObject:get() will
+--- return this value, otherwise valueWhenExpired
+function CpTemporaryObject:set(value, ttlMs)
+	self.value = value
+	self.expiryTime = g_time + ttlMs
+end
+
+--- Get the value of the temporary object
+--- If expired, returns the default value
+function CpTemporaryObject:get()
+	if g_time > self.expiryTime then
+		-- value expired, reset it
+		self.value = self.valueWhenExpired
+	end 
+	return self.value
+end
+
+--- Object slowly adjusting its value
+---@class CpSlowChangingObject
+CpSlowChangingObject = CpObject()
+
+function CpSlowChangingObject:init(targetValue, timeToReachTargetMs)
+	self.value = targetValue
+	self:set(targetValue, timeToReachTargetMs)
+end
+
+function CpSlowChangingObject:set(targetValue, timeToReachTargetMs)
+	self.previousValue = self.value
+	self.targetValue = targetValue
+	self.targetValueMs = g_time
+	self.timeToReachTargetMs = timeToReachTargetMs or 1
+end
+
+function CpSlowChangingObject:get()
+	local age = g_time - self.targetValueMs
+	if age < self.timeToReachTargetMs then
+		-- not reaped yet, return a value proportional to the time until ripe
+		self.value = self.previousValue + (self.targetValue - self.previousValue) * age / self.timeToReachTargetMs
+	else
+		self.value = self.targetValue
+	end
+	return self.value
+end
+
