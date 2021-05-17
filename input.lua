@@ -494,9 +494,9 @@ function courseplay.inputActionCallback(vehicle, actionName, keyStatus)
 			vehicle:setCourseplayFunc('openCloseHud', not vehicle.cp.hud.show, true);
 
 		elseif actionName == 'COURSEPLAY_MOUSEACTION_SECONDARY' then -- open new hud (right mouse button)
-			courseplay.guiManager:handleInputMainGui(true)
+			courseplay.guiManager:handleInputMainGui(true, vehicle)
 		elseif actionName == 'COURSEPLAY_HUD_OPEN' then -- open new hud (lctrl and entf)
-			courseplay.guiManager:handleInputMainGui(false)
+			courseplay.guiManager:handleInputMainGui(false, vehicle)
 
 		--Driver Actions:		
 		elseif actionName == 'COURSEPLAY_CANCELWAIT' and

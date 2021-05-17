@@ -604,7 +604,7 @@ function courseplay:onEnterVehicle()
 	if self.cp.mouseCursorActive then
 		courseplay:setMouseCursor(self, true);
 	end;
-	courseplay.guiManager:onEnterVehicle()
+	courseplay.guiManager:onEnterVehicle(self)
 
 	if self:getIsCourseplayDriving() and self.steeringEnabled then
 		self.steeringEnabled = false;
